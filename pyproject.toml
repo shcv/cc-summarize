@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools >= 64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cc-summarize"
+version = "0.1.0"
+description = "A tool for managing, viewing, and summarizing Claude Code sessions"
+authors = [
+    {name = "Claude Code User"}
+]
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.8"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+]
+dependencies = [
+    "anthropic>=0.35.0",
+    "python-dotenv>=1.0.0",
+    "rich>=13.0.0",
+    "click>=8.1.0",
+]
+
+[project.scripts]
+cc-summarize = "cc_summarize:main"
+
+[tool.setuptools]
+py-modules = ["cc_summarize"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]
