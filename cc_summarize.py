@@ -59,10 +59,11 @@ console = Console()
 @click.option('--retry-failed', is_flag=True, help='Retry failed summaries from cache')
 @click.option('--clear-cache', is_flag=True, help='Clear summary cache')
 @click.option('--verbose', '-v', is_flag=True, help='Show verbose output (e.g., full session IDs)')
+@click.option('--no-truncate', is_flag=True, help='Show full content without truncation')
 @click.version_option(version='0.1.0')
 def main(project, session, from_date, to_date, output_format, with_plans, with_summaries, with_subagent,
          with_assistant, with_all, summarize, plain, separator, output, metadata, interactive, list_sessions, 
-         retry_failed, clear_cache, verbose):
+         retry_failed, clear_cache, verbose, no_truncate):
     """Claude Code Session Summarizer
     
     Manage, view, and summarize Claude Code sessions for a project.
@@ -127,7 +128,7 @@ def main(project, session, from_date, to_date, output_format, with_plans, with_s
         # Main processing logic
         handle_summarization(
             project_path, session, from_date, to_date, detail_level, actual_format, 
-            categories, separator, output, metadata, api_key, bool(summarize)
+            categories, separator, output, metadata, api_key, bool(summarize), no_truncate
         )
         
     except KeyboardInterrupt:
@@ -215,7 +216,7 @@ def handle_retry_failed(project_path: Path, session_id: str, detail_level: str) 
 def handle_summarization(
     project_path: Path, session_id: str, from_date, to_date, detail_level: str, 
     output_format: str, categories: List[str], separator: str, output_file, 
-    include_metadata: bool, api_key: str, use_ai_summaries: bool = False
+    include_metadata: bool, api_key: str, use_ai_summaries: bool = False, no_truncate: bool = False
 ) -> None:
     """Handle main summarization operations."""
     
@@ -262,16 +263,16 @@ def handle_summarization(
     
     if extraction_mode == 'messages':
         # Message extraction mode
-        extractor = MessageExtractor()
+        extractor = MessageExtractor(no_truncate=no_truncate)
         messages = extractor.extract_messages(turns, categories)
         
         if output_format == 'terminal':
-            format_messages_terminal(messages, merged_session_metadata, include_metadata)
+            format_messages_terminal(messages, merged_session_metadata, include_metadata, no_truncate)
         elif output_format == 'plain':
             formatter = PlainFormatter(separator)
             formatter.format_messages(messages, merged_session_metadata, include_metadata, output_file)
         elif output_format == 'markdown':
-            format_messages_markdown(messages, merged_session_metadata, include_metadata, output_file)
+            format_messages_markdown(messages, merged_session_metadata, include_metadata, output_file, no_truncate)
         elif output_format == 'jsonl':
             format_messages_jsonl(messages, merged_session_metadata, include_metadata, output_file)
         
@@ -329,7 +330,7 @@ def handle_summarization(
 
 
 
-def format_messages_terminal(messages: list, session_metadata: dict, include_metadata: bool):
+def format_messages_terminal(messages: list, session_metadata: dict, include_metadata: bool, no_truncate: bool = False):
     """Format categorized messages for terminal display."""
     from rich.panel import Panel
     from rich.text import Text
@@ -384,7 +385,7 @@ def format_messages_terminal(messages: list, session_metadata: dict, include_met
             title.append(timestamp_text, style="dim white")
         
         content = message['content']
-        if len(content) > 2000:
+        if not no_truncate and len(content) > 2000:
             content = content[:2000] + "\n\n[... content truncated ...]"
         
         console.print(
@@ -401,7 +402,7 @@ def format_messages_terminal(messages: list, session_metadata: dict, include_met
             console.print()
 
 
-def format_messages_markdown(messages: list, session_metadata: dict, include_metadata: bool, output_file):
+def format_messages_markdown(messages: list, session_metadata: dict, include_metadata: bool, output_file, no_truncate: bool = False):
     """Format categorized messages as Markdown."""
     from datetime import datetime
     
