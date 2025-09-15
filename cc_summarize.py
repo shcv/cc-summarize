@@ -8,7 +8,7 @@ A tool for managing, viewing, and summarizing Claude Code sessions.
 import os
 import sys
 import click
-from typing import List
+from typing import List, Optional
 from dotenv import load_dotenv
 from pathlib import Path
 from rich.console import Console
@@ -18,9 +18,9 @@ sys.path.insert(0, str(Path(__file__).parent / 'src'))
 
 from session_finder import list_sessions, find_session_by_id
 from parser import SessionParser
-from summarizer import SessionSummarizer
 from no_ai_summarizer import NoAISummarizer, UserOnlyExtractor, MessageExtractor
 from cache import SummaryCache
+from date_parser import parse_since_date, format_since_description
 from formatters.terminal import TerminalFormatter
 from formatters.markdown import MarkdownFormatter
 from formatters.jsonl import JSONLFormatter
@@ -49,6 +49,8 @@ console = Console()
 @click.option('--with-all', is_flag=True, help='Include all message types')
 @click.option('--summarize', type=click.Choice(['minimal', 'normal', 'detailed']), 
               help='Generate AI summaries (requires API key). Default: normal level')
+@click.option('--backend', type=click.Choice(['auto', 'api', 'sdk']), default='auto',
+              help='Backend for AI summaries: auto (SDK if available, else API), api (Anthropic API), sdk (Claude Code SDK)')
 @click.option('--plain', is_flag=True, help='Force plain text output (auto-enabled when piping)')
 @click.option('--separator', default='—————————————————————————', help='Separator between prompts in plain mode (default: em-dashes)')
 @click.option('--output', '-o', type=click.File('w'), default='-', 
@@ -60,10 +62,11 @@ console = Console()
 @click.option('--clear-cache', is_flag=True, help='Clear summary cache')
 @click.option('--verbose', '-v', is_flag=True, help='Show verbose output (e.g., full session IDs)')
 @click.option('--no-truncate', is_flag=True, help='Show full content without truncation')
+@click.option('--since', help='Include only messages since date/time (e.g., 1d, 2h, 30m, 1w, 2024-12-01)')
 @click.version_option(version='0.1.0')
 def main(project, session, from_date, to_date, output_format, with_plans, with_summaries, with_subagent,
-         with_assistant, with_all, summarize, plain, separator, output, metadata, interactive, list_sessions, 
-         retry_failed, clear_cache, verbose, no_truncate):
+         with_assistant, with_all, summarize, backend, plain, separator, output, metadata, interactive, list_sessions,
+         retry_failed, clear_cache, verbose, no_truncate, since):
     """Claude Code Session Summarizer
     
     Manage, view, and summarize Claude Code sessions for a project.
@@ -94,13 +97,25 @@ def main(project, session, from_date, to_date, output_format, with_plans, with_s
             click.echo("Interactive mode not implemented yet.", err=True)
             sys.exit(1)
         
-        # Validate API key for AI summarization operations (only needed when --summarize is used)
+        # Validate API key for AI summarization operations (only needed when --summarize is used with API backend)
         api_key = os.getenv('ANTHROPIC_API_KEY')
-        if not api_key and summarize:
-            click.echo("Error: ANTHROPIC_API_KEY environment variable is required for AI summaries.", err=True)
-            click.echo("Set it in your environment or create a .env file.", err=True)
-            click.echo("Use without --summarize flag to extract messages only (no API required).", err=True)
-            sys.exit(1)
+        if summarize and backend != 'sdk':
+            # Check if we need API key (for 'api' or 'auto' modes)
+            if backend == 'api' and not api_key:
+                click.echo("Error: ANTHROPIC_API_KEY environment variable is required for API backend.", err=True)
+                click.echo("Set it in your environment or create a .env file.", err=True)
+                click.echo("Use --backend sdk to use Claude Code SDK instead (no API key required).", err=True)
+                sys.exit(1)
+            elif backend == 'auto':
+                # Check if SDK is available for auto mode
+                from src.sdk_summarizer import SDKAvailability
+                if not SDKAvailability.is_available() and not api_key:
+                    click.echo("Error: Neither Claude Code SDK nor API key is available.", err=True)
+                    click.echo("Either:", err=True)
+                    click.echo("  1. Set ANTHROPIC_API_KEY environment variable for API access", err=True)
+                    click.echo("  2. Install Claude Code: npm install -g @anthropic-ai/claude-code", err=True)
+                    click.echo("Use without --summarize flag to extract messages only (no AI required).", err=True)
+                    sys.exit(1)
         
         # Handle retry failed summaries
         if retry_failed:
@@ -124,11 +139,22 @@ def main(project, session, from_date, to_date, output_format, with_plans, with_s
             categories.append('assistant')
         if with_all:
             categories = ['user', 'subagent', 'plan', 'assistant', 'session_summary']
-        
+
+        # Parse since date if provided
+        since_date = None
+        if since:
+            try:
+                since_date = parse_since_date(since)
+                description = format_since_description(since, since_date)
+                click.echo(f"Filtering messages {description}", err=True)
+            except ValueError as e:
+                click.echo(f"Error: {e}", err=True)
+                sys.exit(1)
+
         # Main processing logic
         handle_summarization(
-            project_path, session, from_date, to_date, detail_level, actual_format, 
-            categories, separator, output, metadata, api_key, bool(summarize), no_truncate
+            project_path, session, from_date, to_date, detail_level, actual_format,
+            categories, separator, output, metadata, api_key, bool(summarize), no_truncate, backend, since_date
         )
         
     except KeyboardInterrupt:
@@ -137,6 +163,52 @@ def main(project, session, from_date, to_date, output_format, with_plans, with_s
     except Exception as e:
         click.echo(f"Error: {str(e)}", err=True)
         sys.exit(1)
+
+
+def get_summarizer(backend: str, api_key: Optional[str] = None, detail_level: str = 'normal', project_path: Optional[str] = None):
+    """Get the appropriate summarizer based on backend selection.
+    
+    Args:
+        backend: Backend choice ('auto', 'api', 'sdk')
+        api_key: Optional API key for Anthropic API
+        detail_level: Level of detail for summaries
+        
+    Returns:
+        Summarizer instance (SessionSummarizer or SDKSummarizer)
+    """
+    from src.sdk_summarizer import SDKAvailability, SDKSummarizer
+    
+    if backend == 'auto':
+        # Try SDK first
+        if SDKAvailability.is_available():
+            try:
+                click.echo("Using Claude Code SDK for summarization", err=True)
+                return SDKSummarizer(project_path=project_path)
+            except Exception as e:
+                click.echo(f"SDK initialization failed: {e}, falling back to API", err=True)
+                # Fall through to API
+        
+        # Fallback to API
+        if api_key:
+            click.echo("Using Anthropic API for summarization", err=True)
+            from summarizer import SessionSummarizer
+            return SessionSummarizer(api_key)
+        else:
+            raise ValueError("No API key provided and Claude Code SDK not available")
+            
+    elif backend == 'sdk':
+        if not SDKAvailability.is_available():
+            error_msg = SDKAvailability.get_error_message()
+            raise RuntimeError(f"Claude Code SDK not available: {error_msg}")
+        click.echo("Using Claude Code SDK for summarization", err=True)
+        return SDKSummarizer(project_path=project_path)
+        
+    else:  # backend == 'api'
+        if not api_key:
+            raise ValueError("API key required for API backend")
+        click.echo("Using Anthropic API for summarization", err=True)
+        from summarizer import SessionSummarizer
+        return SessionSummarizer(api_key)
 
 
 def handle_clear_cache(session_id: str = None) -> None:
@@ -213,10 +285,30 @@ def handle_retry_failed(project_path: Path, session_id: str, detail_level: str) 
     click.echo("Retry functionality requires re-implementing. Use --clear-cache and re-run instead.")
 
 
+def filter_messages_since(messages, since_date):
+    """Filter messages to only include those since the specified date."""
+    if since_date is None:
+        return messages
+
+    filtered = []
+    for msg in messages:
+        try:
+            # Use the existing datetime property from Message class
+            msg_time = msg.datetime
+            if msg_time >= since_date:
+                filtered.append(msg)
+        except (ValueError, AttributeError):
+            # Include messages without valid timestamps
+            filtered.append(msg)
+
+    return filtered
+
+
 def handle_summarization(
-    project_path: Path, session_id: str, from_date, to_date, detail_level: str, 
-    output_format: str, categories: List[str], separator: str, output_file, 
-    include_metadata: bool, api_key: str, use_ai_summaries: bool = False, no_truncate: bool = False
+    project_path: Path, session_id: str, from_date, to_date, detail_level: str,
+    output_format: str, categories: List[str], separator: str, output_file,
+    include_metadata: bool, api_key: str, use_ai_summaries: bool = False, no_truncate: bool = False,
+    backend: str = 'auto', since_date = None
 ) -> None:
     """Handle main summarization operations."""
     
@@ -244,8 +336,16 @@ def handle_summarization(
     
     # Use the new parse_multiple_files method for automatic deduplication
     messages = parser.parse_multiple_files(session_files)
+
+    # Apply since date filter if specified
+    if since_date:
+        original_count = len(messages)
+        messages = filter_messages_since(messages, since_date)
+        filtered_count = len(messages)
+        click.echo(f"Filtered from {original_count} to {filtered_count} messages based on --since filter")
+
     turns = parser.build_conversation_turns(messages)
-    
+
     click.echo(f"Found {len(turns)} unique conversation turns after deduplication")
     
     # Create session metadata for the merged result
@@ -284,7 +384,8 @@ def handle_summarization(
         if not use_ai_summaries:
             summarizer = NoAISummarizer()
         else:
-            summarizer = SessionSummarizer(api_key)
+            # Use the new backend selection logic
+            summarizer = get_summarizer(backend, api_key, detail_level, str(project_path))
         
         # Generate summaries
         with click.progressbar(
@@ -294,12 +395,20 @@ def handle_summarization(
             summaries = []
             for turn in turns:
                 if hasattr(summarizer, 'summarize_turn'):
-                    if 'SessionSummarizer' in str(type(summarizer)):
+                    # Check if it's an AI summarizer (SessionSummarizer or SDKSummarizer)
+                    if 'SessionSummarizer' in str(type(summarizer)) or 'SDKSummarizer' in str(type(summarizer)):
                         summary = summarizer.summarize_turn(turn, detail_level, merged_session_metadata['session_id'])
                     else:
+                        # NoAISummarizer
                         summary = summarizer.summarize_turn(turn, merged_session_metadata['session_id'])
                 else:
                     summary = summarizer.summarize_turn(turn)
+
+                # Check for errors and fail fast
+                if summary.error:
+                    click.echo(f"Error: Failed to summarize turn: {summary.error}", err=True)
+                    sys.exit(1)
+
                 summaries.append(summary)
                 bar.update(1)
         
