@@ -77,6 +77,108 @@ class SDKSummarizer:
         isolated_dir.mkdir(exist_ok=True)
 
         return str(isolated_dir)
+
+    def _clear_temp_directory(self):
+        """Clear the isolated working directory for fresh file generation."""
+        temp_dir = Path(self._isolated_cwd)
+        if temp_dir.exists():
+            # Remove all files in the directory
+            for file_path in temp_dir.glob("*"):
+                try:
+                    if file_path.is_file():
+                        file_path.unlink()
+                    elif file_path.is_dir():
+                        import shutil
+                        shutil.rmtree(file_path)
+                except (OSError, PermissionError):
+                    pass  # Ignore errors, will be recreated anyway
+
+    def _write_message_files(self, turn: ConversationTurn, detail_level: str) -> list:
+        """Write assistant messages to separate files and return file references."""
+        self._clear_temp_directory()
+
+        file_refs = []
+        temp_dir = Path(self._isolated_cwd)
+
+        # Write user message to file
+        user_content = self._extract_message_content(turn.user_message)
+        if user_content:
+            user_file = temp_dir / "user_message.txt"
+            with open(user_file, 'w', encoding='utf-8') as f:
+                f.write(user_content)
+            file_refs.append(("user", str(user_file)))
+
+        # Write each assistant message to a separate file
+        for i, msg in enumerate(turn.assistant_messages):
+            # Extract text content
+            content = self._extract_message_content(msg)
+
+            # Create filename based on message index and type
+            if msg.tool_name:
+                filename = f"assistant_{i:02d}_{msg.tool_name.lower()}.txt"
+            else:
+                filename = f"assistant_{i:02d}_text.txt"
+
+            msg_file = temp_dir / filename
+
+            # Build content including both text and tool information
+            file_content_parts = []
+
+            if content:
+                file_content_parts.append(f"Content: {content}")
+
+            if msg.tool_name and msg.tool_args:
+                tool_info = self._format_tool_call_for_prompt(msg.tool_name, msg.tool_args, detail_level)
+                file_content_parts.append(f"Tool Call: {tool_info}")
+
+                # For detailed mode, include full tool arguments
+                if detail_level == 'detailed' and msg.tool_args:
+                    file_content_parts.append(f"Tool Arguments: {json.dumps(msg.tool_args, indent=2)}")
+
+            if file_content_parts:
+                with open(msg_file, 'w', encoding='utf-8') as f:
+                    f.write('\n\n'.join(file_content_parts))
+                file_refs.append(("assistant", str(msg_file)))
+
+        return file_refs
+
+    def _extract_sdk_message_content(self, message) -> str:
+        """Extract text content from SDK message objects."""
+
+        # Handle ResultMessage objects (final summaries)
+        if hasattr(message, 'result') and message.result:
+            return str(message.result)
+
+        # Handle SystemMessage objects
+        if hasattr(message, 'data') and isinstance(message.data, dict):
+            # Skip system init/config messages
+            if message.data.get('type') == 'system':
+                return ""
+
+        # Handle messages with content attribute (standard format)
+        if hasattr(message, 'content'):
+            if isinstance(message.content, str):
+                return message.content
+            elif isinstance(message.content, list):
+                # Handle structured content (list of items)
+                text_parts = []
+                for item in message.content:
+                    if isinstance(item, dict) and item.get('type') == 'text':
+                        text_parts.append(item.get('text', ''))
+                    elif isinstance(item, str):
+                        text_parts.append(item)
+                return '\n'.join(text_parts)
+
+        # Handle direct string messages
+        if isinstance(message, str):
+            return message
+
+        # Handle messages with text attribute
+        if hasattr(message, 'text'):
+            return str(message.text)
+
+        # Skip system/metadata messages, return empty for unknown types
+        return ""
     
     def _get_system_prompt(self, detail_level: str) -> str:
         """Get cached system prompt for the given detail level."""
@@ -114,32 +216,81 @@ Output only the summary, no additional formatting."""
         return prompt
     
     def _build_prompt(self, turn: ConversationTurn, detail_level: str) -> str:
-        """Build a prompt from a conversation turn for summarization."""
+        """Build a prompt using file references for message content."""
+        # Write messages to separate files and get file references
+        file_refs = self._write_message_files(turn, detail_level)
+
         parts = []
-        
-        # Add user message
-        parts.append(f"User message: {self._extract_message_content(turn.user_message)}\n")
-        
-        # Add assistant responses
-        if turn.assistant_messages:
-            parts.append("Assistant actions:\n")
-            for msg in turn.assistant_messages:
-                content = self._extract_message_content(msg)
-                if msg.tool_name:
-                    parts.append(f"- Tool: {msg.tool_name}")
-                    if msg.tool_args and detail_level != 'minimal':
-                        # Include some tool args for context
-                        args_summary = self._summarize_tool_args(msg.tool_name, msg.tool_args)
-                        if args_summary:
-                            parts.append(f"  {args_summary}")
-                if content and not msg.tool_name:
-                    # Include non-tool assistant messages
-                    parts.append(f"- Response: {content[:500]}...")
-        
-        # Add instruction
-        parts.append("\nPlease summarize what the assistant did in response to the user's message.")
-        
+        parts.append("Please analyze the following conversation turn and provide a concise summary of what the assistant accomplished.")
+        parts.append("")
+
+        # Add file references for each message
+        for msg_type, file_path in file_refs:
+            if msg_type == "user":
+                parts.append(f"USER MESSAGE: @{file_path}")
+            elif msg_type == "assistant":
+                parts.append(f"ASSISTANT MESSAGE: @{file_path}")
+
+        parts.append("")
+        parts.append("---")
+
+        # Add instruction based on detail level
+        if detail_level == 'minimal':
+            parts.append("Provide a one-line summary focusing only on file operations and key commands executed.")
+        elif detail_level == 'normal':
+            parts.append("Provide a concise summary of the assistant's actions and their purpose.")
+        else:  # detailed
+            parts.append("Provide a comprehensive summary including all actions taken, reasoning, and outcomes.")
+
         return '\n'.join(parts)
+
+    def _format_tool_call_for_prompt(self, tool_name: str, tool_args: Dict, detail_level: str) -> str:
+        """Format tool call information for inclusion in prompts."""
+        if detail_level == 'minimal':
+            # For minimal detail, just show the tool name and key parameter
+            if tool_name in ['Edit', 'MultiEdit', 'Write', 'Read']:
+                file_path = tool_args.get('file_path', '')
+                return f"{tool_name} {file_path}"
+            elif tool_name == 'Bash':
+                command = tool_args.get('command', '')[:50]
+                return f"{tool_name}: {command}"
+            else:
+                return tool_name
+
+        elif detail_level == 'normal':
+            # For normal detail, include key parameters
+            if tool_name in ['Edit', 'MultiEdit']:
+                file_path = tool_args.get('file_path', '')
+                old_str = tool_args.get('old_string', '')[:100]
+                new_str = tool_args.get('new_string', '')[:100]
+                return f"{tool_name} {file_path}: '{old_str}' -> '{new_str}'"
+            elif tool_name == 'Write':
+                file_path = tool_args.get('file_path', '')
+                content_preview = tool_args.get('content', '')[:200]
+                return f"{tool_name} {file_path}: {content_preview}"
+            elif tool_name == 'Read':
+                file_path = tool_args.get('file_path', '')
+                return f"{tool_name} {file_path}"
+            elif tool_name == 'Bash':
+                command = tool_args.get('command', '')
+                desc = tool_args.get('description', '')
+                return f"{tool_name}: {desc or command}"
+            elif tool_name in ['Grep', 'Glob']:
+                pattern = tool_args.get('pattern', '')
+                path = tool_args.get('path', '.')
+                return f"{tool_name}: '{pattern}' in {path}"
+            else:
+                # Generic tool info
+                key_args = []
+                for key in ['file_path', 'command', 'pattern', 'description']:
+                    if key in tool_args:
+                        value = str(tool_args[key])[:50]
+                        key_args.append(f"{key}={value}")
+                return f"{tool_name}: {', '.join(key_args)}"
+
+        else:  # detailed
+            # For detailed, include all relevant parameters
+            return f"{tool_name}: {json.dumps(tool_args, indent=None)}"
     
     def _extract_message_content(self, msg: Message) -> str:
         """Extract readable content from a message."""
@@ -216,24 +367,10 @@ Output only the summary, no additional formatting."""
             # Collect summary from SDK
             summary_parts = []
             async for message in query(prompt=prompt, options=options):
-                # The SDK returns message objects, extract text content
-                if hasattr(message, 'content'):
-                    # Handle message objects with content attribute
-                    if isinstance(message.content, str):
-                        summary_parts.append(message.content)
-                    elif isinstance(message.content, list):
-                        # Handle structured content
-                        for item in message.content:
-                            if isinstance(item, dict) and item.get('type') == 'text':
-                                summary_parts.append(item.get('text', ''))
-                            elif isinstance(item, str):
-                                summary_parts.append(item)
-                elif isinstance(message, str):
-                    # Handle direct string messages
-                    summary_parts.append(message)
-                else:
-                    # Fallback: convert to string
-                    summary_parts.append(str(message))
+                # Extract text content from different SDK message types
+                text_content = self._extract_sdk_message_content(message)
+                if text_content:
+                    summary_parts.append(text_content)
 
             summary = ''.join(summary_parts).strip()
             

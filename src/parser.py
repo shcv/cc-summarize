@@ -150,15 +150,27 @@ class SessionParser:
         """Group messages into conversation turns (user message + responses)."""
         if messages is None:
             messages = self.messages
-        
+
         turns = []
         current_user_message = None
         current_assistant_messages = []
         current_system_messages = []
         current_tool_messages = []
-        
+
         for message in messages:
             if message.type == 'user':
+                # Skip if this is a tool response masquerading as a user message
+                if self._is_tool_response(message):
+                    continue
+
+                # Skip if this is system noise
+                if self._is_system_noise_message(message):
+                    continue
+
+                # Skip if this is a session summary
+                if self._is_session_summary_message(message):
+                    continue
+
                 # Save previous turn if we have one
                 if current_user_message:
                     turn = ConversationTurn(
@@ -170,20 +182,20 @@ class SessionParser:
                     turn.duration_seconds = self._calculate_turn_duration(turn)
                     turn.total_tokens = self._calculate_turn_tokens(turn)
                     turns.append(turn)
-                
+
                 # Start new turn
                 current_user_message = message
                 current_assistant_messages = []
                 current_system_messages = []
                 current_tool_messages = []
-                
+
             elif message.type == 'assistant':
                 current_assistant_messages.append(message)
             elif message.type == 'system':
                 current_system_messages.append(message)
             else:
                 current_tool_messages.append(message)
-        
+
         # Don't forget the last turn
         if current_user_message:
             turn = ConversationTurn(
@@ -195,9 +207,92 @@ class SessionParser:
             turn.duration_seconds = self._calculate_turn_duration(turn)
             turn.total_tokens = self._calculate_turn_tokens(turn)
             turns.append(turn)
-        
+
         return turns
-    
+
+    def _is_tool_response(self, message) -> bool:
+        """Check if a user message is actually a tool response."""
+        content = message.content
+
+        if isinstance(content, list) and content:
+            # Check if the first item is a tool_result
+            first_item = content[0]
+            if isinstance(first_item, dict) and first_item.get("type") == "tool_result":
+                return True
+
+        return False
+
+    def _is_system_noise_message(self, message) -> bool:
+        """Check if message content is system noise rather than actual user input."""
+        content = self._extract_text_content(message.content)
+        if not content:
+            return True
+
+        content_lower = content.lower().strip()
+
+        # Skip command-related messages
+        if (
+            content.startswith("<command-")
+            or content.startswith("<local-command-")
+            or "command-message" in content
+            or "[Request interrupted" in content
+        ):
+            return True
+
+        # Skip very short generic responses
+        if len(content_lower) < 10:
+            return True
+
+        # Skip pure formatting/caveat messages
+        noise_patterns = [
+            "caveat: the messages below",
+            "do not respond to these messages",
+            "kept model as",
+        ]
+
+        for pattern in noise_patterns:
+            if pattern in content_lower:
+                return True
+
+        return False
+
+    def _is_session_summary_message(self, message) -> bool:
+        """Check if message content is a session continuation summary."""
+        content = self._extract_text_content(message.content)
+        if not content:
+            return False
+
+        content_lower = content.lower().strip()
+
+        # Check for session continuation indicators
+        session_summary_phrases = [
+            "this session is being continued",
+            "analysis:",
+            "summary:",
+            "looking through the conversation chronologically",
+            "the conversation is summarized below",
+            "primary request and intent",
+            "key technical concepts",
+            "files and code sections",
+        ]
+
+        return any(phrase in content_lower for phrase in session_summary_phrases)
+
+    def _extract_text_content(self, content) -> str:
+        """Extract clean text from message content."""
+        if isinstance(content, str):
+            return content.strip()
+        elif isinstance(content, list):
+            # Handle tool results and complex content
+            parts = []
+            for item in content:
+                if isinstance(item, dict):
+                    if item.get("type") == "text":
+                        parts.append(item.get("text", ""))
+            return " ".join(parts).strip()
+        else:
+            return ""
+
     def _calculate_turn_duration(self, turn: ConversationTurn) -> Optional[float]:
         """Calculate duration of a conversation turn in seconds."""
         if not turn.assistant_messages:

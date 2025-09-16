@@ -160,7 +160,25 @@ class SummaryCache:
                         cleared_count += 1
                     except IOError:
                         pass
-        
+
+        return cleared_count
+
+    def clear_cache_for_sessions(self, session_ids: List[str]) -> int:
+        """Clear cache entries for multiple specific sessions."""
+        cleared_count = 0
+
+        for directory in [self.summaries_dir, self.errors_dir]:
+            for cache_file in directory.glob('*.json'):
+                # Check if this cache file matches any of the session IDs
+                for session_id in session_ids:
+                    if cache_file.name.startswith(f"{session_id}_"):
+                        try:
+                            cache_file.unlink()
+                            cleared_count += 1
+                        except IOError:
+                            pass
+                        break  # Found match, no need to check other session IDs
+
         return cleared_count
     
     def clear_all_cache(self) -> int:

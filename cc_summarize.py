@@ -59,14 +59,15 @@ console = Console()
 @click.option('--interactive', '-i', is_flag=True, help='Launch interactive wizard')
 @click.option('--list', 'list_sessions', is_flag=True, help='List available sessions for project')
 @click.option('--retry-failed', is_flag=True, help='Retry failed summaries from cache')
-@click.option('--clear-cache', is_flag=True, help='Clear summary cache')
+@click.option('--clear-cache', is_flag=True, help='Clear all summary cache (all projects)')
+@click.option('--redo', is_flag=True, help='Regenerate summaries, ignoring cache (for current filters)')
 @click.option('--verbose', '-v', is_flag=True, help='Show verbose output (e.g., full session IDs)')
 @click.option('--no-truncate', is_flag=True, help='Show full content without truncation')
 @click.option('--since', help='Include only messages since date/time (e.g., 1d, 2h, 30m, 1w, 2024-12-01)')
 @click.version_option(version='0.1.0')
 def main(project, session, from_date, to_date, output_format, with_plans, with_summaries, with_subagent,
          with_assistant, with_all, summarize, backend, plain, separator, output, metadata, interactive, list_sessions,
-         retry_failed, clear_cache, verbose, no_truncate, since):
+         retry_failed, clear_cache, redo, verbose, no_truncate, since):
     """Claude Code Session Summarizer
     
     Manage, view, and summarize Claude Code sessions for a project.
@@ -82,9 +83,20 @@ def main(project, session, from_date, to_date, output_format, with_plans, with_s
         actual_format = 'plain'
     
     try:
+        # Validate conflicting options
+        if redo and clear_cache:
+            click.echo("Error: Cannot use --redo and --clear-cache together. Use one or the other.", err=True)
+            sys.exit(1)
+
+        if redo and not summarize:
+            click.echo("Error: --redo flag requires --summarize option (nothing to regenerate without AI summaries).", err=True)
+            sys.exit(1)
+
         # Handle cache operations first
         if clear_cache:
-            handle_clear_cache(session)
+            # Only pass project_path if user explicitly specified a project, otherwise do global clear
+            project_for_cache = project_path if project != '.' else None
+            handle_clear_cache(session, project_for_cache)
             return
         
         # Handle session listing
@@ -154,7 +166,7 @@ def main(project, session, from_date, to_date, output_format, with_plans, with_s
         # Main processing logic
         handle_summarization(
             project_path, session, from_date, to_date, detail_level, actual_format,
-            categories, separator, output, metadata, api_key, bool(summarize), no_truncate, backend, since_date
+            categories, separator, output, metadata, api_key, bool(summarize), no_truncate, backend, since_date, redo
         )
         
     except KeyboardInterrupt:
@@ -211,20 +223,34 @@ def get_summarizer(backend: str, api_key: Optional[str] = None, detail_level: st
         return SessionSummarizer(api_key)
 
 
-def handle_clear_cache(session_id: str = None) -> None:
+def handle_clear_cache(session_id: str = None, project_path: Path = None) -> None:
     """Handle cache clearing operations."""
     cache = SummaryCache()
-    
+
     if session_id:
         cleared = cache.clear_cache(session_id)
         click.echo(f"Cleared {cleared} cache entries for session {session_id}")
+    elif project_path:
+        # Clear cache for this specific project
+        sessions = list_sessions(str(project_path))
+        if not sessions:
+            click.echo("No sessions found for this project - nothing to clear.")
+            return
+
+        session_ids = [Path(s.get('file_path', '')).stem for s in sessions if s.get('file_path')]
+        if session_ids:
+            cleared = cache.clear_cache_for_sessions(session_ids)
+            project_name = project_path.name
+            click.echo(f"Cleared {cleared} cache entries for project '{project_name}' ({len(session_ids)} sessions)")
+        else:
+            click.echo("No valid session IDs found for this project.")
     else:
         # Show cache stats first
         stats = cache.get_cache_stats()
         if stats['successful_summaries'] == 0 and stats['failed_summaries'] == 0:
             click.echo("Cache is already empty.")
             return
-        
+
         # Confirm before clearing all
         if click.confirm(f"Clear all cache ({stats['successful_summaries'] + stats['failed_summaries']} entries)?"):
             cache.clear_all_cache()
@@ -308,7 +334,7 @@ def handle_summarization(
     project_path: Path, session_id: str, from_date, to_date, detail_level: str,
     output_format: str, categories: List[str], separator: str, output_file,
     include_metadata: bool, api_key: str, use_ai_summaries: bool = False, no_truncate: bool = False,
-    backend: str = 'auto', since_date = None
+    backend: str = 'auto', since_date = None, redo: bool = False
 ) -> None:
     """Handle main summarization operations."""
     
@@ -347,6 +373,16 @@ def handle_summarization(
     turns = parser.build_conversation_turns(messages)
 
     click.echo(f"Found {len(turns)} unique conversation turns after deduplication")
+
+    # Handle redo flag: clear cache for current sessions before processing
+    if redo and use_ai_summaries:
+        # Use the merged session ID pattern that will be used for caching
+        merged_session_id = f"merged-{len(session_files)}-sessions"
+        session_ids = [merged_session_id]
+
+        cache = SummaryCache()
+        cleared_count = cache.clear_cache_for_sessions(session_ids)
+        click.echo(f"Cleared {cleared_count} cached summaries for current sessions (--redo)", err=True)
     
     # Create session metadata for the merged result
     merged_session_metadata = {
@@ -356,9 +392,17 @@ def handle_summarization(
     }
     
     # Determine extraction mode
-    if use_ai_summaries:
+    if use_ai_summaries and len(categories) == 1 and categories[0] == 'user':
+        # Pure AI summarization mode (only user messages shown)
+        extraction_mode = 'summaries'
+    elif use_ai_summaries and len(categories) > 1:
+        # Hybrid mode: show selected categories, summarize the rest
+        extraction_mode = 'hybrid'
+    elif use_ai_summaries:
+        # AI summarization with specific category filtering
         extraction_mode = 'summaries'
     else:
+        # Pure message extraction mode
         extraction_mode = 'messages'
     
     if extraction_mode == 'messages':
@@ -378,7 +422,81 @@ def handle_summarization(
         
         category_summary = ', '.join(categories)
         click.echo(f"  ✅ Extracted {len(messages)} messages ({category_summary})")
-        
+
+    elif extraction_mode == 'hybrid':
+        # Hybrid mode: extract selected categories, summarize the rest
+        extractor = MessageExtractor(no_truncate=no_truncate)
+        extracted_messages = extractor.extract_messages(turns, categories)
+
+        # Determine which categories to summarize (everything not in the selected categories)
+        all_categories = ['user', 'subagent', 'plan', 'assistant', 'session_summary']
+        categories_to_summarize = [cat for cat in all_categories if cat not in categories]
+
+        if categories_to_summarize:
+            # Generate summaries for the filtered-out categories
+            summarizer = get_summarizer(backend, api_key, detail_level, str(project_path))
+
+            # Create summary entries for content that was filtered out
+            summary_entries = []
+            for turn in turns:
+                # Check if this turn has content in categories that need summarizing
+                turn_needs_summary = False
+
+                # Check if there are assistant messages when assistant is not in displayed categories
+                if 'assistant' in categories_to_summarize and turn.assistant_messages:
+                    turn_needs_summary = True
+
+                # Add other category checks as needed
+                # (plan, subagent, session_summary checks would go here)
+
+                if turn_needs_summary:
+                    summary = summarizer.summarize_turn(turn, detail_level, merged_session_metadata['session_id'])
+                    if not summary.error:
+                        # Create a summary message entry
+                        summary_entry = {
+                            'number': len(summary_entries) + len(extracted_messages) + 1,
+                            'category': 'summary',
+                            'content': summary.summary,
+                            'timestamp': turn.user_message.timestamp if turn.user_message else None,
+                            'uuid': f"summary-{len(summary_entries)}"
+                        }
+                        summary_entries.append(summary_entry)
+
+            # Combine extracted messages and summaries, sort by timestamp/order
+            all_entries = extracted_messages + summary_entries
+            # Re-number for proper display order
+            for i, entry in enumerate(all_entries, 1):
+                entry['number'] = i
+
+            # Display the hybrid result
+            if output_format == 'terminal':
+                format_messages_terminal(all_entries, merged_session_metadata, include_metadata, no_truncate)
+            elif output_format == 'plain':
+                formatter = PlainFormatter(separator)
+                formatter.format_messages(all_entries, merged_session_metadata, include_metadata, output_file)
+            elif output_format == 'markdown':
+                format_messages_markdown(all_entries, merged_session_metadata, include_metadata, output_file, no_truncate)
+            elif output_format == 'jsonl':
+                format_messages_jsonl(all_entries, merged_session_metadata, include_metadata, output_file)
+
+            category_summary = ', '.join(categories)
+            summary_summary = ', '.join(categories_to_summarize)
+            click.echo(f"  ✅ Hybrid mode: Extracted {len(extracted_messages)} messages ({category_summary}), Summarized {len(summary_entries)} blocks ({summary_summary})")
+        else:
+            # No categories to summarize, fall back to pure extraction
+            if output_format == 'terminal':
+                format_messages_terminal(extracted_messages, merged_session_metadata, include_metadata, no_truncate)
+            elif output_format == 'plain':
+                formatter = PlainFormatter(separator)
+                formatter.format_messages(extracted_messages, merged_session_metadata, include_metadata, output_file)
+            elif output_format == 'markdown':
+                format_messages_markdown(extracted_messages, merged_session_metadata, include_metadata, output_file, no_truncate)
+            elif output_format == 'jsonl':
+                format_messages_jsonl(extracted_messages, merged_session_metadata, include_metadata, output_file)
+
+            category_summary = ', '.join(categories)
+            click.echo(f"  ✅ Extracted {len(extracted_messages)} messages ({category_summary})")
+
     else:
         # Summarization modes (AI or no-AI)
         if not use_ai_summaries:
