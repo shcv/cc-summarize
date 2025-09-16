@@ -239,9 +239,6 @@ class SessionParser:
         ):
             return True
 
-        # Skip very short generic responses
-        if len(content_lower) < 10:
-            return True
 
         # Skip pure formatting/caveat messages
         noise_patterns = [

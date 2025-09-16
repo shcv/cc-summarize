@@ -7,7 +7,7 @@ readme = {file = ["README.md"], content-type = "text/markdown"}
 
 [project]
 name = "cc-summarize"
-version = "1.0.0"
+version = "1.0.1"
 description = "A tool for managing, viewing, and summarizing Claude Code sessions"
 authors = [
     {name = "Claude Code User"}
