@@ -2,6 +2,9 @@
 requires = ["setuptools >= 64", "wheel"]
 build-backend = "setuptools.build_meta"
 
+[tool.setuptools.dynamic]
+readme = {file = ["README.md"], content-type = "text/markdown"}
+
 [project]
 name = "cc-summarize"
 version = "1.0.0"
@@ -10,12 +13,11 @@ authors = [
     {name = "Claude Code User"}
 ]
 readme = "README.md"
-license = {text = "MIT"}
+license = "CC0-1.0"
 requires-python = ">=3.10"
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
@@ -40,3 +42,6 @@ py-modules = ["cc_summarize"]
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["src*"]
+
+[tool.setuptools.package-data]
+"*" = ["*.md", "*.txt"]
