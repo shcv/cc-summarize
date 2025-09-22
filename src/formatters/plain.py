@@ -53,50 +53,63 @@ class PlainFormatter:
         return plain_content
     
     def _format_turn(
-        self, 
-        turn: ConversationTurn, 
+        self,
+        turn: ConversationTurn,
         summary: SummaryResult,
         include_metadata: bool = False
     ) -> List[str]:
         """Format a single conversation turn as plain text."""
         lines = []
-        
+
         # User message
         user_content = self._extract_user_content(turn.user_message.content)
-        
-        # Add timestamp if metadata requested
-        if include_metadata and turn.user_message.timestamp:
+
+        # Add timestamp for user message
+        if turn.user_message.timestamp:
             try:
                 dt = datetime.fromisoformat(turn.user_message.timestamp.replace('Z', '+00:00'))
-                timestamp = dt.strftime('%Y-%m-%d %H:%M:%S')
-                lines.append(f"[{timestamp}]")
+                timestamp = dt.strftime('%m-%d %H:%M:%S')
+                lines.append(f"User [{timestamp}]:")
             except:
-                pass
-        
+                lines.append("User:")
+        else:
+            lines.append("User:")
+
         # User content
         if user_content.strip():
             lines.append(user_content)
         else:
             lines.append("[Empty user message]")
-        
+
         # Assistant summary (if not user-only mode)
         if summary and summary.summary:
             lines.append("")  # Blank line between user and assistant
-            lines.append("Assistant:")
-            
+
+            # Format assistant header with timestamp
+            assistant_header = "Assistant"
+            if turn.assistant_messages and turn.assistant_messages[0].timestamp:
+                try:
+                    dt = datetime.fromisoformat(turn.assistant_messages[0].timestamp.replace('Z', '+00:00'))
+                    timestamp = dt.strftime('%m-%d %H:%M:%S')
+                    assistant_header += f" [{timestamp}]"
+                except:
+                    pass
+            assistant_header += ":"
+            lines.append(assistant_header)
+
             # Add token count if available and metadata requested
             if include_metadata and summary.tokens_used:
                 lines.append(f"[{summary.tokens_used} tokens]")
-            
+
             lines.append(summary.summary)
-            
+
             # Add tool calls if present and not empty
             if summary.tool_calls:
                 lines.append("")
                 lines.append("Tools used:")
                 for tool_call in summary.tool_calls:
                     lines.append(f"• {tool_call}")
-        
+
         return lines
     
     def _extract_user_content(self, content: Any) -> str:
@@ -188,11 +201,11 @@ class PlainFormatter:
                 lines.append(self.separator)
                 lines.append("")
             
-            # Add timestamp if metadata requested
-            if include_metadata and prompt.get('timestamp'):
+            # Add timestamp
+            if prompt.get('timestamp'):
                 try:
                     dt = datetime.fromisoformat(prompt['timestamp'].replace('Z', '+00:00'))
-                    timestamp = dt.strftime('%Y-%m-%d %H:%M:%S')
+                    timestamp = dt.strftime('%m-%d %H:%M:%S')
                     lines.append(f"[{timestamp}]")
                 except:
                     pass

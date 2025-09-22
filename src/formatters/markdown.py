@@ -140,7 +140,7 @@ class MarkdownFormatter:
         lines.extend(self._format_user_message(turn.user_message, include_metadata))
         
         # Assistant summary
-        lines.extend(self._format_assistant_summary(summary))
+        lines.extend(self._format_assistant_summary(summary, turn.assistant_messages))
         
         lines.append("")
         
@@ -149,45 +149,55 @@ class MarkdownFormatter:
     def _format_user_message(self, message: Message, include_metadata: bool = False) -> List[str]:
         """Format user message."""
         lines = []
-        
+
         # User section header
         header = "### 👤 User"
-        if include_metadata and message.timestamp:
+        if message.timestamp:
             try:
                 dt = datetime.fromisoformat(message.timestamp.replace('Z', '+00:00'))
-                time_str = dt.strftime('%H:%M:%S')
+                time_str = dt.strftime('%m-%d %H:%M:%S')
                 header += f" _{time_str}_"
             except:
                 pass
-        
+
         lines.append(header)
         lines.append("")
-        
+
         # User content
         content = self._extract_user_content(message.content)
         if not content.strip():
             content = "_[Empty message]_"
-        
+
         # Format as blockquote
         for line in content.split('\n'):
             lines.append(f"> {line}")
-        
+
         lines.append("")
-        
+
         return lines
     
-    def _format_assistant_summary(self, summary: SummaryResult) -> List[str]:
+    def _format_assistant_summary(self, summary: SummaryResult, assistant_messages: List[Message] = None) -> List[str]:
         """Format assistant summary."""
         lines = []
-        
+
         # Assistant section header
         header = "### 🤖 Assistant"
+
+        # Add timestamp from first assistant message
+        if assistant_messages and assistant_messages[0].timestamp:
+            try:
+                dt = datetime.fromisoformat(assistant_messages[0].timestamp.replace('Z', '+00:00'))
+                time_str = dt.strftime('%m-%d %H:%M:%S')
+                header += f" _{time_str}_"
+            except:
+                pass
+
         if summary.tokens_used:
             header += f" _{summary.tokens_used} tokens_"
-        
+
         lines.append(header)
         lines.append("")
-        
+
         if summary.error:
             lines.append("**❌ Error generating summary:**")
             lines.append("")
@@ -200,18 +210,18 @@ class MarkdownFormatter:
                 lines.append(summary.summary)
             else:
                 lines.append("_[No summary available]_")
-            
+
             # Tool calls
             if summary.tool_calls:
                 lines.append("")
                 lines.append("**🔧 Tools used:**")
                 lines.append("")
-                
+
                 for tool_call in summary.tool_calls:
                     lines.append(f"- `{tool_call}`")
-        
+
         lines.append("")
-        
+
         return lines
     
     def _format_footer(self, metadata: Dict[str, Any]) -> List[str]:

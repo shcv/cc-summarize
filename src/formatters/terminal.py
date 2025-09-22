@@ -117,35 +117,35 @@ class TerminalFormatter:
         self._print_user_message(turn.user_message, include_metadata)
         
         # Assistant summary
-        self._print_assistant_summary(summary)
+        self._print_assistant_summary(summary, turn.assistant_messages)
         
     def _print_user_message(self, message: Message, include_metadata: bool = False) -> None:
         """Print user message with formatting."""
-        
+
         # Extract clean user content
         content = self._extract_user_content(message.content)
-        
+
         if not content.strip():
             content = "[Empty message]"
-        
+
         # Truncate very long messages
         if len(content) > 1000:
             content = content[:1000] + "..."
-        
-        # Format timestamp if requested
+
+        # Format timestamp
         timestamp_text = ""
-        if include_metadata and message.timestamp:
+        if message.timestamp:
             try:
                 dt = datetime.fromisoformat(message.timestamp.replace('Z', '+00:00'))
-                timestamp_text = f" [{dt.strftime('%H:%M:%S')}]"
+                timestamp_text = f" [{dt.strftime('%m-%d %H:%M:%S')}]"
             except:
                 pass
-        
+
         # User message panel
         user_text = Text("👤 User", style=f"bold {self.colors['user']}")
         if timestamp_text:
             user_text.append(timestamp_text, style=self.colors['timestamp'])
-        
+
         self.console.print(
             Panel(
                 content,
@@ -156,9 +156,9 @@ class TerminalFormatter:
             )
         )
     
-    def _print_assistant_summary(self, summary: SummaryResult) -> None:
+    def _print_assistant_summary(self, summary: SummaryResult, assistant_messages: List[Message] = None) -> None:
         """Print assistant summary with tool calls."""
-        
+
         if summary.error:
             # Error case
             error_text = Text(f"❌ Assistant (Error)", style=f"bold {self.colors['error']}")
@@ -172,30 +172,40 @@ class TerminalFormatter:
                 )
             )
             return
-        
+
         # Success case
         assistant_text = Text("🤖 Assistant", style=f"bold {self.colors['assistant']}")
+
+        # Add timestamp from first assistant message
+        if assistant_messages and assistant_messages[0].timestamp:
+            try:
+                dt = datetime.fromisoformat(assistant_messages[0].timestamp.replace('Z', '+00:00'))
+                timestamp_text = f" [{dt.strftime('%m-%d %H:%M:%S')}]"
+                assistant_text.append(timestamp_text, style=self.colors['timestamp'])
+            except:
+                pass
+
         if summary.tokens_used:
             assistant_text.append(f" [{summary.tokens_used} tokens]", style=self.colors['metadata'])
-        
+
         # Main content
         content_parts = []
-        
+
         if summary.summary:
             content_parts.append(summary.summary)
-        
+
         # Add tool calls if present
         if summary.tool_calls:
             content_parts.append("")  # Spacing
             content_parts.append("🔧 Tools used:")
             for tool_call in summary.tool_calls[:10]:  # Limit to 10 tools
                 content_parts.append(f"  • {tool_call}")
-            
+
             if len(summary.tool_calls) > 10:
                 content_parts.append(f"  • ... and {len(summary.tool_calls) - 10} more")
-        
+
         content = "\n".join(content_parts) if content_parts else "[No summary available]"
-        
+
         self.console.print(
             Panel(
                 content,
