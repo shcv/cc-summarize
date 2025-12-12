@@ -3,9 +3,36 @@
 import os
 import subprocess
 import shutil
+from pathlib import Path
 from typing import Optional
 
 import click
+
+
+def _get_isolated_claude_config() -> Path:
+    """Get isolated Claude config directory for cc-summarize.
+
+    This prevents summary generation from polluting the user's Claude history.
+    """
+    xdg_data = os.environ.get('XDG_DATA_HOME', os.path.expanduser('~/.local/share'))
+    claude_dir = Path(xdg_data) / 'cc-summarize' / 'claude'
+    claude_dir.mkdir(parents=True, exist_ok=True)
+
+    # Symlink credentials from user's Claude config
+    user_creds = Path.home() / '.claude' / '.credentials.json'
+    our_creds = claude_dir / '.credentials.json'
+
+    if user_creds.exists() and not our_creds.exists():
+        our_creds.symlink_to(user_creds)
+
+    # Also symlink settings.json if it exists
+    user_settings = Path.home() / '.claude' / 'settings.json'
+    our_settings = claude_dir / 'settings.json'
+
+    if user_settings.exists() and not our_settings.exists():
+        our_settings.symlink_to(user_settings)
+
+    return claude_dir
 
 
 def generate_commit_summary(content: str, project_path: str) -> str:
@@ -145,12 +172,18 @@ def _run_ai_prompt(prompt: str, project_path: str) -> str:
     # Try SDK first (check if claude command exists)
     if shutil.which('claude'):
         try:
-            # Use -p for non-interactive prompt mode (doesn't create session files)
+            # Get isolated config directory to avoid polluting user's history
+            config_dir = _get_isolated_claude_config()
+            env = os.environ.copy()
+            env['CLAUDE_CONFIG_DIR'] = str(config_dir)
+
+            # Use -p for non-interactive prompt mode
             result = subprocess.run(
                 ['claude', '-p', prompt],
                 capture_output=True,
                 text=True,
-                timeout=120
+                timeout=120,
+                env=env
             )
             if result.returncode == 0:
                 return result.stdout.strip()
