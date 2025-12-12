@@ -2,9 +2,6 @@
 requires = ["setuptools >= 64", "wheel"]
 build-backend = "setuptools.build_meta"
 
-[tool.setuptools.dynamic]
-readme = {file = ["README.md"], content-type = "text/markdown"}
-
 [project]
 name = "cc-summarize"
 version = "1.2.0"
@@ -16,21 +13,22 @@ readme = "README.md"
 license = "CC0-1.0"
 requires-python = ">=3.10"
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Environment :: Console",
+    "Topic :: Software Development :: Documentation",
 ]
 dependencies = [
-    "anthropic>=0.35.0",
     "claude-agent-sdk>=0.1.0",
     "python-dotenv>=1.0.0",
     "rich>=13.0.0",
     "click>=8.1.0",
-    "anyio>=4.0.0",
 ]
 
 [project.optional-dependencies]
