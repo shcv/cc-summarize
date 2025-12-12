@@ -84,8 +84,11 @@ class PlainFormatter(BaseFormatter):
         else:
             for session in sessions:
                 session_id = session.get('session_id', 'Unknown')
-                if not verbose and len(session_id) > 15:
-                    session_id = session_id[:15] + '...'
+                if not verbose:
+                    # Elide at first hyphen
+                    first_hyphen = session_id.find('-')
+                    if first_hyphen > 0:
+                        session_id = session_id[:first_hyphen]
                 message_count = session.get('message_count', 0)
 
                 file_size = session.get('file_size', 0)
@@ -95,7 +98,11 @@ class PlainFormatter(BaseFormatter):
                 dt = parse_iso_timestamp(last_modified)
                 date_str = dt.strftime('%Y-%m-%d %H:%M') if dt else 'Unknown'
 
-                lines.append(f"{session_id} | {message_count} messages | {size_str} | {date_str}")
+                description = session.get('description', '')
+                if len(description) > 60:
+                    description = description[:57] + '...'
+
+                lines.append(f"{session_id} | {message_count} msgs | {size_str} | {date_str} | {description}")
 
         lines.append("")
         plain_content = '\n'.join(lines)

@@ -464,11 +464,12 @@ class SessionParser:
                 len(content_text) > 1000):
                 return 'session_summary'
         
-        # System/command noise
+        # System/command noise (includes warmup messages)
         if message.type == 'user' and isinstance(message.content, str):
-            if (message.content.startswith('<command-') or 
+            if (message.content.startswith('<command-') or
                 message.content.startswith('<local-command-') or
-                'command-message' in message.content):
+                'command-message' in message.content or
+                message.content.strip() == 'Warmup'):
                 return 'system_noise'
         
         # Check for subagent prompts (user messages matching Task prompts)

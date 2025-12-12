@@ -83,7 +83,8 @@ class JSONLFormatter(BaseFormatter):
                 "message_count": session.get('message_count'),
                 "file_size": session.get('file_size'),
                 "start_time": session.get('start_time'),
-                "last_modified": session.get('last_modified')
+                "last_modified": session.get('last_modified'),
+                "description": session.get('description')
             }
 
             # Remove None values for cleaner JSON

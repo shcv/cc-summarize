@@ -94,25 +94,31 @@ class TerminalFormatter(BaseFormatter):
             self.console.print("No sessions found.", style=self.colors['metadata'])
             return None
 
-        # Create table
+        # Create table - expand to full width
         table = Table(
             title="Available Sessions",
             box=box.ROUNDED,
             border_style=self.colors['border'],
-            title_style="bold"
+            title_style="bold",
+            expand=True
         )
 
-        # Set column width based on verbose flag
-        session_id_width = 36 if verbose else 14
-        table.add_column("Session ID", style=self.colors['user'], width=session_id_width)
-        table.add_column("Messages", justify="right", style=self.colors['metadata'])
-        table.add_column("Size", justify="right", style=self.colors['metadata'])
-        table.add_column("Last Modified", style=self.colors['timestamp'])
+        # Session ID column - show full UUID in verbose mode, elide at first hyphen otherwise
+        session_id_width = 36 if verbose else 8
+        table.add_column("Session ID", style=self.colors['user'], width=session_id_width, no_wrap=True)
+        table.add_column("Msgs", justify="right", style=self.colors['metadata'], width=4)
+        table.add_column("Size", justify="right", style=self.colors['metadata'], width=6)
+        table.add_column("Modified", style=self.colors['timestamp'], width=11)
+        # Description column takes remaining space
+        table.add_column("Description", style="white", ratio=1, overflow="ellipsis", no_wrap=True)
 
         for session in sessions:
             session_id = session.get('session_id', 'Unknown')
-            if not verbose and len(session_id) > 11:
-                session_id = session_id[:11] + '...'
+            if not verbose:
+                # Elide at first hyphen (show only the first segment of UUID)
+                first_hyphen = session_id.find('-')
+                if first_hyphen > 0:
+                    session_id = session_id[:first_hyphen]
             message_count = str(session.get('message_count', 0))
 
             # Format file size
@@ -124,7 +130,13 @@ class TerminalFormatter(BaseFormatter):
             dt = parse_iso_timestamp(last_modified)
             date_str = dt.strftime('%m-%d %H:%M') if dt else 'Unknown'
 
-            table.add_row(session_id, message_count, size_str, date_str)
+            # Get description
+            description = session.get('description', '')
+            # Truncate very long descriptions for display
+            if len(description) > 100:
+                description = description[:97] + '...'
+
+            table.add_row(session_id, message_count, size_str, date_str, description)
 
         self.console.print(table)
         return None

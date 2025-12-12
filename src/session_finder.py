@@ -41,12 +41,15 @@ def find_session_files(project_path: str) -> List[Path]:
     claude_dir = find_claude_projects_dir()
     project_name = path_to_project_name(str(Path(project_path).resolve()))
     project_dir = claude_dir / project_name
-    
+
     if not project_dir.exists():
         return []
-    
-    # Find all .jsonl files in the project directory
-    session_files = list(project_dir.glob('*.jsonl'))
+
+    # Find all .jsonl files, excluding agent-* subagent files
+    session_files = [
+        f for f in project_dir.glob('*.jsonl')
+        if not f.name.startswith('agent-')
+    ]
     return sorted(session_files, key=lambda f: f.stat().st_mtime, reverse=True)
 
 
@@ -54,36 +57,75 @@ def get_session_metadata(session_file: Path) -> Dict:
     """Extract basic metadata from a session file."""
     try:
         with open(session_file, 'r') as f:
-            # Read first few lines to get basic info
-            first_line = f.readline().strip()
-            if not first_line:
-                return {}
-            
-            first_msg = json.loads(first_line)
-            
-            # Get session ID and start time
-            session_id = first_msg.get('sessionId', session_file.stem)
-            start_time = first_msg.get('timestamp')
-            
-            # Count total lines (messages)
-            f.seek(0)
-            message_count = sum(1 for _ in f)
-            
+            # Read lines to get basic info
+            session_id = session_file.stem
+            start_time = None
+            summary = None
+            first_user_content = None
+            message_count = 0
+
+            for line in f:
+                message_count += 1
+                line = line.strip()
+                if not line:
+                    continue
+
+                try:
+                    msg = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                # Look for session summary (Claude Code stores these)
+                if msg.get('type') == 'summary' and msg.get('summary'):
+                    summary = msg.get('summary')
+
+                # Get session ID from first message with sessionId
+                if not start_time and msg.get('sessionId'):
+                    session_id = msg.get('sessionId', session_id)
+                    start_time = msg.get('timestamp')
+
+                # Get first user message content as fallback description
+                if first_user_content is None and msg.get('type') == 'user':
+                    message = msg.get('message', {})
+                    content = message.get('content', '')
+                    if isinstance(content, str) and content:
+                        # Skip meta/command/warmup messages
+                        if not content.startswith(('<command-', '<local-command-', 'Caveat:')) and content.strip() != 'Warmup':
+                            first_user_content = content
+                    elif isinstance(content, list):
+                        for item in content:
+                            if isinstance(item, dict) and item.get('type') == 'text':
+                                text = item.get('text', '')
+                                if text and not text.startswith(('<command-', '<local-command-')) and text.strip() != 'Warmup':
+                                    first_user_content = text
+                                    break
+
             # Get file modification time as last activity
             last_modified = datetime.fromtimestamp(
-                session_file.stat().st_mtime, 
+                session_file.stat().st_mtime,
                 tz=timezone.utc
             )
-            
+
+            # Use summary if available, otherwise first user content
+            description = summary or first_user_content or ''
+            # Sanitize description: collapse whitespace, remove newlines
+            if description:
+                description = ' '.join(description.split())
+
+            # Mark as empty if no real content (only system messages, warmup, etc.)
+            has_content = bool(summary or first_user_content)
+
             return {
                 'session_id': session_id,
                 'file_path': session_file,
                 'message_count': message_count,
                 'start_time': start_time,
                 'last_modified': last_modified.isoformat(),
-                'file_size': session_file.stat().st_size
+                'file_size': session_file.stat().st_size,
+                'description': description,
+                'has_content': has_content
             }
-            
+
     except (json.JSONDecodeError, IOError, KeyError) as e:
         return {
             'session_id': session_file.stem,
@@ -130,15 +172,27 @@ def list_sessions(
     project_path: str,
     from_date: Optional[datetime] = None,
     to_date: Optional[datetime] = None,
-    limit: Optional[int] = None
+    limit: Optional[int] = None,
+    include_empty: bool = False
 ) -> List[Dict]:
-    """List all sessions for a project with optional filtering."""
+    """List all sessions for a project with optional filtering.
+
+    Args:
+        project_path: Path to the project directory
+        from_date: Only include sessions after this date
+        to_date: Only include sessions before this date
+        limit: Maximum number of sessions to return
+        include_empty: If False (default), exclude sessions with no real content
+    """
     session_files = find_session_files(project_path)
-    
+
     sessions = []
     for session_file in session_files:
         metadata = get_session_metadata(session_file)
         if metadata:  # Only include valid sessions
+            # Skip empty sessions unless explicitly requested
+            if not include_empty and not metadata.get('has_content', True):
+                continue
             sessions.append(metadata)
     
     # Filter by date if specified
