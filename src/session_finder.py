@@ -8,6 +8,15 @@ from typing import List, Dict, Optional, Tuple
 import re
 
 
+class SessionNotFoundError(Exception):
+    """Raised when no sessions are found for a project."""
+
+    def __init__(self, message: str, project_path: str = None, searched_path: str = None):
+        self.project_path = project_path
+        self.searched_path = searched_path
+        super().__init__(message)
+
+
 def path_to_project_name(project_path: str) -> str:
     """Convert a project path to Claude Code's hyphenated format.
     
@@ -145,13 +154,13 @@ def list_sessions(
 
 def find_session_by_id(project_path: str, session_id: str) -> Optional[Path]:
     """Find a specific session file by ID.
-    
+
     Supports both full session IDs and partial IDs (prefixes).
     If multiple sessions match a partial ID, returns the most recent one.
     """
     session_files = find_session_files(project_path)
     matches = []
-    
+
     for session_file in session_files:
         full_session_id = session_file.stem
         # First try exact match
@@ -160,10 +169,59 @@ def find_session_by_id(project_path: str, session_id: str) -> Optional[Path]:
         # Then try prefix match
         elif full_session_id.startswith(session_id):
             matches.append(session_file)
-    
+
     # If we have partial matches, return the most recent one
     if matches:
         # Files are already sorted by modification time (most recent first)
         return matches[0]
-    
+
     return None
+
+
+def get_session_search_info(project_path: str) -> Dict[str, str]:
+    """Get diagnostic information about session search paths.
+
+    Returns info about where sessions would be looked for,
+    useful for error messages.
+    """
+    try:
+        claude_dir = find_claude_projects_dir()
+        project_name = path_to_project_name(str(Path(project_path).resolve()))
+        project_dir = claude_dir / project_name
+
+        return {
+            'project_path': str(Path(project_path).resolve()),
+            'claude_projects_dir': str(claude_dir),
+            'expected_session_dir': str(project_dir),
+            'session_dir_exists': project_dir.exists(),
+        }
+    except FileNotFoundError as e:
+        return {
+            'project_path': str(Path(project_path).resolve()),
+            'error': str(e),
+        }
+
+
+def format_no_sessions_error(project_path: str) -> str:
+    """Format a helpful error message when no sessions are found."""
+    info = get_session_search_info(project_path)
+
+    lines = ["No sessions found matching criteria."]
+    lines.append("")
+
+    if 'error' in info:
+        lines.append(f"Error: {info['error']}")
+    else:
+        lines.append(f"Project path: {info['project_path']}")
+        lines.append(f"Searched in: {info['expected_session_dir']}")
+
+        if not info['session_dir_exists']:
+            lines.append("")
+            lines.append("The session directory does not exist.")
+            lines.append("This could mean:")
+            lines.append("  - Claude Code hasn't been used in this project yet")
+            lines.append("  - The project path is incorrect")
+            lines.append("")
+            lines.append("Tip: Run 'cc-summarize --list' from within your project directory")
+
+    return '\n'.join(lines)

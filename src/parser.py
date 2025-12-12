@@ -477,21 +477,35 @@ class SessionParser:
             if content_key in task_prompts:
                 return 'subagent'
         
-        # Assistant responses with plans
+        # Assistant responses with plans - must have ExitPlanMode tool call OR
+        # substantial structured plan content (not just mentions of "plan")
         if message.type == 'assistant' and isinstance(message.content, list):
+            has_exit_plan_mode = False
+            has_substantial_plan_structure = False
+            total_text_length = 0
+            plan_header_count = 0
+
             for item in message.content:
                 if isinstance(item, dict):
-                    # Check text items for plan keywords
-                    if item.get('type') == 'text':
-                        text = item.get('text', '').lower()
-                        if any(phrase in text for phrase in [
-                            '## plan', '# plan', 'implementation plan', 
-                            '## comprehensive', '## step', '### step'
-                        ]):
-                            return 'plan'
-                    # Check tool_use items for ExitPlanMode calls
-                    elif item.get('type') == 'tool_use' and item.get('name') == 'ExitPlanMode':
-                        return 'plan'
+                    # Check for ExitPlanMode tool call (strongest indicator)
+                    if item.get('type') == 'tool_use' and item.get('name') == 'ExitPlanMode':
+                        has_exit_plan_mode = True
+                    # Check text items for structured plan content
+                    elif item.get('type') == 'text':
+                        text = item.get('text', '')
+                        text_lower = text.lower()
+                        total_text_length += len(text)
+                        # Count plan structure markers (headers, phases, steps)
+                        for phrase in ['## phase', '### step', '## step', '### phase',
+                                       '## implementation', '## comprehensive']:
+                            plan_header_count += text_lower.count(phrase)
+
+            # Substantial plan = ExitPlanMode OR (long content with multiple plan headers)
+            # This avoids marking "I'll create a plan" as a plan
+            has_substantial_plan_structure = (total_text_length > 1000 and plan_header_count >= 2)
+
+            if has_exit_plan_mode or has_substantial_plan_structure:
+                return 'plan'
         
         # Default categories based on type
         if message.type == 'user':

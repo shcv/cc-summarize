@@ -12,19 +12,28 @@ from typing import List, Optional
 from dotenv import load_dotenv
 from pathlib import Path
 from rich.console import Console
+from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeElapsedColumn, TimeRemainingColumn
 
 # Add src to path for imports
 sys.path.insert(0, str(Path(__file__).parent / 'src'))
 
-from session_finder import list_sessions, find_session_by_id
+from session_finder import list_sessions, find_session_by_id, format_no_sessions_error
 from parser import SessionParser
 from no_ai_summarizer import NoAISummarizer, UserOnlyExtractor, MessageExtractor
 from cache import SummaryCache
 from date_parser import parse_since_date, format_since_description
-from formatters.terminal import TerminalFormatter
-from formatters.markdown import MarkdownFormatter
-from formatters.jsonl import JSONLFormatter
-from formatters.plain import PlainFormatter, should_use_plain_output
+from formatters import (
+    TerminalFormatter,
+    MarkdownFormatter,
+    JSONLFormatter,
+    PlainFormatter,
+    should_use_plain_output,
+)
+from cli.summary_gen import (
+    generate_commit_summary,
+    generate_requirements_summary,
+    generate_work_summary,
+)
 
 # Load environment variables from .env file
 load_dotenv()
@@ -33,8 +42,8 @@ load_dotenv()
 console = Console()
 
 @click.command()
-@click.option('--project', '-p', type=click.Path(exists=True, file_okay=False, dir_okay=True), 
-              default='.', help='Project directory (default: current)')
+@click.option('--project', '-p',
+              default='.', help='Project directory - relative or absolute path (default: current)')
 @click.option('--session', '-s', help='Specific session ID to process')
 @click.option('--from-date', '--from', 'from_date', type=click.DateTime(formats=['%Y-%m-%d']),
               help='Start date filter (YYYY-MM-DD)')
@@ -47,10 +56,8 @@ console = Console()
 @click.option('--with-subagent', is_flag=True, help='Include subagent prompts')
 @click.option('--with-assistant', is_flag=True, help='Include all assistant responses')
 @click.option('--with-all', is_flag=True, help='Include all message types')
-@click.option('--summarize', type=click.Choice(['minimal', 'normal', 'detailed']), 
-              help='Generate AI summaries (requires API key). Default: normal level')
-@click.option('--backend', type=click.Choice(['auto', 'api', 'sdk']), default='auto',
-              help='Backend for AI summaries: auto (SDK if available, else API), api (Anthropic API), sdk (Claude Code SDK)')
+@click.option('--summarize', type=click.Choice(['minimal', 'normal', 'detailed']),
+              help='Generate AI summaries using Claude Agent SDK. Levels: minimal, normal, detailed')
 @click.option('--plain', is_flag=True, help='Force plain text output (auto-enabled when piping)')
 @click.option('--separator', default='—————————————————————————', help='Separator between prompts in plain mode (default: em-dashes)')
 @click.option('--output', '-o', type=click.File('w'), default='-', 
@@ -64,16 +71,24 @@ console = Console()
 @click.option('--verbose', '-v', is_flag=True, help='Show verbose output (e.g., full session IDs)')
 @click.option('--no-truncate', is_flag=True, help='Show full content without truncation')
 @click.option('--since', help='Include only messages since date/time (e.g., 1d, 2h, 30m, 1w, 2024-12-01)')
-@click.version_option(version='0.1.0')
+@click.option('--summary', type=click.Choice(['default', 'commit', 'requirements']),
+              help='Generate a summary: default (session work), commit (conventional commit message), requirements (extract user requirements)')
+@click.version_option(version='1.2.0')
 def main(project, session, from_date, to_date, output_format, with_plans, with_summaries, with_subagent,
-         with_assistant, with_all, summarize, backend, plain, separator, output, metadata, interactive, list_sessions,
-         retry_failed, clear_cache, redo, verbose, no_truncate, since):
+         with_assistant, with_all, summarize, plain, separator, output, metadata, interactive, list_sessions,
+         retry_failed, clear_cache, redo, verbose, no_truncate, since, summary):
     """Claude Code Session Summarizer
-    
+
     Manage, view, and summarize Claude Code sessions for a project.
     """
-    
-    project_path = Path(project).resolve()
+
+    # Handle project path - support both relative and absolute paths
+    # Convert to absolute path even if directory doesn't exist
+    if os.path.isabs(project):
+        project_path = Path(project)
+    else:
+        project_path = Path.cwd() / project
+    project_path = project_path.resolve()
     
     # Determine actual output format
     actual_format = output_format
@@ -109,25 +124,14 @@ def main(project, session, from_date, to_date, output_format, with_plans, with_s
             click.echo("Interactive mode not implemented yet.", err=True)
             sys.exit(1)
         
-        # Validate API key for AI summarization operations (only needed when --summarize is used with API backend)
-        api_key = os.getenv('ANTHROPIC_API_KEY')
-        if summarize and backend != 'sdk':
-            # Check if we need API key (for 'api' or 'auto' modes)
-            if backend == 'api' and not api_key:
-                click.echo("Error: ANTHROPIC_API_KEY environment variable is required for API backend.", err=True)
-                click.echo("Set it in your environment or create a .env file.", err=True)
-                click.echo("Use --backend sdk to use Claude Code SDK instead (no API key required).", err=True)
+        # Validate SDK availability for AI summarization
+        if summarize:
+            from src.summarizer import SummarizerAvailability
+            if not SummarizerAvailability.is_available():
+                error_msg = SummarizerAvailability.get_error_message()
+                click.echo(f"Error: Claude Agent SDK not available: {error_msg}", err=True)
+                click.echo("Use without --summarize flag to extract messages only (no AI required).", err=True)
                 sys.exit(1)
-            elif backend == 'auto':
-                # Check if SDK is available for auto mode
-                from src.sdk_summarizer import SDKAvailability
-                if not SDKAvailability.is_available() and not api_key:
-                    click.echo("Error: Neither Claude Code SDK nor API key is available.", err=True)
-                    click.echo("Either:", err=True)
-                    click.echo("  1. Set ANTHROPIC_API_KEY environment variable for API access", err=True)
-                    click.echo("  2. Install Claude Code: npm install -g @anthropic-ai/claude-code", err=True)
-                    click.echo("Use without --summarize flag to extract messages only (no AI required).", err=True)
-                    sys.exit(1)
         
         # Handle retry failed summaries
         if retry_failed:
@@ -166,7 +170,7 @@ def main(project, session, from_date, to_date, output_format, with_plans, with_s
         # Main processing logic
         handle_summarization(
             project_path, session, from_date, to_date, detail_level, actual_format,
-            categories, separator, output, metadata, api_key, bool(summarize), no_truncate, backend, since_date, redo
+            categories, separator, output, metadata, bool(summarize), no_truncate, since_date, redo, summary
         )
         
     except KeyboardInterrupt:
@@ -177,50 +181,31 @@ def main(project, session, from_date, to_date, output_format, with_plans, with_s
         sys.exit(1)
 
 
-def get_summarizer(backend: str, api_key: Optional[str] = None, detail_level: str = 'normal', project_path: Optional[str] = None):
-    """Get the appropriate summarizer based on backend selection.
-    
+def get_summarizer(project_path: Optional[str] = None):
+    """Get the SDK summarizer.
+
     Args:
-        backend: Backend choice ('auto', 'api', 'sdk')
-        api_key: Optional API key for Anthropic API
-        detail_level: Level of detail for summaries
-        
+        project_path: Optional project path for the summarizer
+
     Returns:
-        Summarizer instance (SessionSummarizer or SDKSummarizer)
+        Summarizer instance
     """
-    from src.sdk_summarizer import SDKAvailability, SDKSummarizer
-    
-    if backend == 'auto':
-        # Try SDK first
-        if SDKAvailability.is_available():
-            try:
-                click.echo("Using Claude Code SDK for summarization", err=True)
-                return SDKSummarizer(project_path=project_path)
-            except Exception as e:
-                click.echo(f"SDK initialization failed: {e}, falling back to API", err=True)
-                # Fall through to API
-        
-        # Fallback to API
-        if api_key:
-            click.echo("Using Anthropic API for summarization", err=True)
-            from summarizer import SessionSummarizer
-            return SessionSummarizer(api_key)
-        else:
-            raise ValueError("No API key provided and Claude Code SDK not available")
-            
-    elif backend == 'sdk':
-        if not SDKAvailability.is_available():
-            error_msg = SDKAvailability.get_error_message()
-            raise RuntimeError(f"Claude Code SDK not available: {error_msg}")
-        click.echo("Using Claude Code SDK for summarization", err=True)
-        return SDKSummarizer(project_path=project_path)
-        
-    else:  # backend == 'api'
-        if not api_key:
-            raise ValueError("API key required for API backend")
-        click.echo("Using Anthropic API for summarization", err=True)
-        from summarizer import SessionSummarizer
-        return SessionSummarizer(api_key)
+    from src.summarizer import Summarizer
+    return Summarizer(project_path=project_path)
+
+
+def get_turn_description(turn, max_length: int = 50) -> str:
+    """Extract a short description from a conversation turn for progress display."""
+    from src.utils import extract_user_content
+
+    content = extract_user_content(turn.user_message.content)
+    # Take first line and truncate
+    first_line = content.split('\n')[0].strip()
+    if len(first_line) > max_length:
+        return first_line[:max_length-3] + "..."
+    return first_line if first_line else "(empty)"
+
+
 
 
 def handle_clear_cache(session_id: str = None, project_path: Path = None) -> None:
@@ -286,29 +271,30 @@ def handle_list_sessions(project_path: Path, from_date, to_date, output_format: 
 
 
 def handle_retry_failed(project_path: Path, session_id: str, detail_level: str) -> None:
-    """Handle retrying failed summaries."""
+    """Handle retrying failed summaries.
+
+    Note: This feature is currently disabled. Use --redo to regenerate summaries.
+    """
     cache = SummaryCache()
     failed_entries = cache.get_failed_entries(session_id)
-    
+
     if not failed_entries:
         click.echo("No failed summaries found to retry.")
         return
-    
-    click.echo(f"Found {len(failed_entries)} failed summaries to retry...")
-    
-    summarizer = SessionSummarizer()
-    
-    for i, entry in enumerate(failed_entries, 1):
-        click.echo(f"Retrying {i}/{len(failed_entries)}: {entry.session_id[:8]}...")
-        
-        # We can't easily reconstruct the original content from cache,
-        # so we'll need to re-parse the session
-        # For now, just report what needs to be retried
-        click.echo(f"  Session: {entry.session_id}")
-        click.echo(f"  Detail level: {entry.detail_level}")
-        click.echo(f"  Error: {entry.summary_result.error}")
-    
-    click.echo("Retry functionality requires re-implementing. Use --clear-cache and re-run instead.")
+
+    click.echo(f"Found {len(failed_entries)} failed summaries:", err=True)
+    click.echo("", err=True)
+
+    for entry in failed_entries:
+        click.echo(f"  Session: {entry.session_id[:16]}...", err=True)
+        click.echo(f"  Error: {entry.summary_result.error}", err=True)
+        click.echo("", err=True)
+
+    click.echo("To regenerate these summaries, use:", err=True)
+    click.echo("  cc-summarize --summarize normal --redo", err=True)
+    click.echo("", err=True)
+    click.echo("Or clear the cache first:", err=True)
+    click.echo("  cc-summarize --clear-cache", err=True)
 
 
 def filter_messages_since(messages, since_date):
@@ -330,14 +316,16 @@ def filter_messages_since(messages, since_date):
     return filtered
 
 
+
+
 def handle_summarization(
     project_path: Path, session_id: str, from_date, to_date, detail_level: str,
     output_format: str, categories: List[str], separator: str, output_file,
-    include_metadata: bool, api_key: str, use_ai_summaries: bool = False, no_truncate: bool = False,
-    backend: str = 'auto', since_date = None, redo: bool = False
+    include_metadata: bool, use_ai_summaries: bool = False, no_truncate: bool = False,
+    since_date = None, redo: bool = False, generate_summary: Optional[str] = None
 ) -> None:
     """Handle main summarization operations."""
-    
+
     # Find sessions to process
     if session_id:
         session_file = find_session_by_id(str(project_path), session_id)
@@ -348,12 +336,12 @@ def handle_summarization(
     else:
         sessions = list_sessions(str(project_path), from_date, to_date)
         if not sessions:
-            click.echo("No sessions found matching criteria.")
+            click.echo(format_no_sessions_error(str(project_path)), err=True)
             return
         session_files = [s.get('file_path') for s in sessions if s.get('file_path')]
-    
+
     if not session_files:
-        click.echo("No session files found.")
+        click.echo(format_no_sessions_error(str(project_path)), err=True)
         return
     
     # Initialize parser and parse all files with deduplication
@@ -374,15 +362,19 @@ def handle_summarization(
 
     click.echo(f"Found {len(turns)} unique conversation turns after deduplication")
 
-    # Handle redo flag: clear cache for current sessions before processing
+    # Handle redo flag: clear cache only for the filtered turns
     if redo and use_ai_summaries:
-        # Use the merged session ID pattern that will be used for caching
+        from src.summarizer import Summarizer
+        summarizer = Summarizer(project_path=str(project_path))
         merged_session_id = f"merged-{len(session_files)}-sessions"
-        session_ids = [merged_session_id]
 
-        cache = SummaryCache()
-        cleared_count = cache.clear_cache_for_sessions(session_ids)
-        click.echo(f"Cleared {cleared_count} cached summaries for current sessions (--redo)", err=True)
+        # Clear cache entries only for the turns that match the current filter
+        cleared_count = 0
+        for turn in turns:
+            if summarizer.clear_turn_cache(turn, detail_level, merged_session_id):
+                cleared_count += 1
+
+        click.echo(f"Cleared {cleared_count} cached summaries for filtered turns (--redo)", err=True)
     
     # Create session metadata for the merged result
     merged_session_metadata = {
@@ -409,19 +401,70 @@ def handle_summarization(
         # Message extraction mode
         extractor = MessageExtractor(no_truncate=no_truncate)
         messages = extractor.extract_messages(turns, categories)
-        
+
+        # Capture output if summary generation is requested
+        import io
+        if generate_summary:
+            # Create a string buffer to capture output
+            output_buffer = io.StringIO()
+            actual_output = output_buffer
+        else:
+            actual_output = output_file
+
         if output_format == 'terminal':
-            format_messages_terminal(messages, merged_session_metadata, include_metadata, no_truncate)
+            formatter = TerminalFormatter(console)
+            formatter.format_messages(messages, merged_session_metadata, include_metadata, actual_output)
         elif output_format == 'plain':
             formatter = PlainFormatter(separator)
-            formatter.format_messages(messages, merged_session_metadata, include_metadata, output_file)
+            formatter.format_messages(messages, merged_session_metadata, include_metadata, actual_output)
         elif output_format == 'markdown':
-            format_messages_markdown(messages, merged_session_metadata, include_metadata, output_file, no_truncate)
+            formatter = MarkdownFormatter()
+            formatter.format_messages(messages, merged_session_metadata, include_metadata, actual_output)
         elif output_format == 'jsonl':
-            format_messages_jsonl(messages, merged_session_metadata, include_metadata, output_file)
-        
+            formatter = JSONLFormatter()
+            formatter.format_messages(messages, merged_session_metadata, include_metadata, actual_output)
+
         category_summary = ', '.join(categories)
         click.echo(f"  ✅ Extracted {len(messages)} messages ({category_summary})")
+
+        # Generate and output summary if requested
+        if generate_summary:
+            captured_content = output_buffer.getvalue()
+
+            # Determine which summary generator to use
+            if generate_summary == 'commit':
+                click.echo("\n" + "="*80, err=True)
+                click.echo("Generating conventional commit message...", err=True)
+                click.echo("="*80 + "\n", err=True)
+                summary_title = "CONVENTIONAL COMMIT MESSAGE"
+                generator = generate_commit_summary
+            elif generate_summary == 'requirements':
+                click.echo("\n" + "="*80, err=True)
+                click.echo("Extracting requirements from session...", err=True)
+                click.echo("="*80 + "\n", err=True)
+                summary_title = "EXTRACTED REQUIREMENTS"
+                generator = generate_requirements_summary
+            else:  # 'default'
+                click.echo("\n" + "="*80, err=True)
+                click.echo("Generating detailed work summary...", err=True)
+                click.echo("="*80 + "\n", err=True)
+                summary_title = "DETAILED WORK SUMMARY"
+                generator = generate_work_summary
+
+            try:
+                summary_result = generator(captured_content, str(project_path))
+                # Output the original content first
+                output_file.write(captured_content)
+                # Then output the summary
+                output_file.write("\n\n" + "="*80 + "\n")
+                output_file.write(summary_title + "\n")
+                output_file.write("="*80 + "\n\n")
+                output_file.write(summary_result)
+                output_file.write("\n")
+            except Exception as e:
+                import traceback
+                click.echo(f"Error generating summary: {e}", err=True)
+                click.echo(traceback.format_exc(), err=True)
 
     elif extraction_mode == 'hybrid':
         # Hybrid mode: extract selected categories, summarize the rest
@@ -434,7 +477,7 @@ def handle_summarization(
 
         if categories_to_summarize:
             # Generate summaries for the filtered-out categories
-            summarizer = get_summarizer(backend, api_key, detail_level, str(project_path))
+            summarizer = get_summarizer(str(project_path))
 
             # Create summary entries for content that was filtered out
             summary_entries = []
@@ -470,14 +513,17 @@ def handle_summarization(
 
             # Display the hybrid result
             if output_format == 'terminal':
-                format_messages_terminal(all_entries, merged_session_metadata, include_metadata, no_truncate)
+                formatter = TerminalFormatter(console)
+                formatter.format_messages(all_entries, merged_session_metadata, include_metadata, output_file)
             elif output_format == 'plain':
                 formatter = PlainFormatter(separator)
                 formatter.format_messages(all_entries, merged_session_metadata, include_metadata, output_file)
             elif output_format == 'markdown':
-                format_messages_markdown(all_entries, merged_session_metadata, include_metadata, output_file, no_truncate)
+                formatter = MarkdownFormatter()
+                formatter.format_messages(all_entries, merged_session_metadata, include_metadata, output_file)
             elif output_format == 'jsonl':
-                format_messages_jsonl(all_entries, merged_session_metadata, include_metadata, output_file)
+                formatter = JSONLFormatter()
+                formatter.format_messages(all_entries, merged_session_metadata, include_metadata, output_file)
 
             category_summary = ', '.join(categories)
             summary_summary = ', '.join(categories_to_summarize)
@@ -485,14 +531,17 @@ def handle_summarization(
         else:
             # No categories to summarize, fall back to pure extraction
             if output_format == 'terminal':
-                format_messages_terminal(extracted_messages, merged_session_metadata, include_metadata, no_truncate)
+                formatter = TerminalFormatter(console)
+                formatter.format_messages(extracted_messages, merged_session_metadata, include_metadata, output_file)
             elif output_format == 'plain':
                 formatter = PlainFormatter(separator)
                 formatter.format_messages(extracted_messages, merged_session_metadata, include_metadata, output_file)
             elif output_format == 'markdown':
-                format_messages_markdown(extracted_messages, merged_session_metadata, include_metadata, output_file, no_truncate)
+                formatter = MarkdownFormatter()
+                formatter.format_messages(extracted_messages, merged_session_metadata, include_metadata, output_file)
             elif output_format == 'jsonl':
-                format_messages_jsonl(extracted_messages, merged_session_metadata, include_metadata, output_file)
+                formatter = JSONLFormatter()
+                formatter.format_messages(extracted_messages, merged_session_metadata, include_metadata, output_file)
 
             category_summary = ', '.join(categories)
             click.echo(f"  ✅ Extracted {len(extracted_messages)} messages ({category_summary})")
@@ -502,213 +551,206 @@ def handle_summarization(
         if not use_ai_summaries:
             summarizer = NoAISummarizer()
         else:
-            # Use the new backend selection logic
-            summarizer = get_summarizer(backend, api_key, detail_level, str(project_path))
-        
-        # Generate summaries
-        with click.progressbar(
-            length=len(turns), 
-            label="Summarizing turns"
-        ) as bar:
-            summaries = []
-            for turn in turns:
-                if hasattr(summarizer, 'summarize_turn'):
-                    # Check if it's an AI summarizer (SessionSummarizer or SDKSummarizer)
-                    if 'SessionSummarizer' in str(type(summarizer)) or 'SDKSummarizer' in str(type(summarizer)):
-                        summary = summarizer.summarize_turn(turn, detail_level, merged_session_metadata['session_id'])
-                    else:
-                        # NoAISummarizer
-                        summary = summarizer.summarize_turn(turn, merged_session_metadata['session_id'])
+            # Get SDK summarizer
+            summarizer = get_summarizer(str(project_path))
+
+        is_ai_summarizer = 'Summarizer' in str(type(summarizer)) and 'NoAI' not in str(type(summarizer))
+
+        # Pre-check cache to determine which turns need summarization
+        session_id = merged_session_metadata['session_id']
+        cached_turns = []
+        uncached_turns = []
+        uncached_indices = []
+
+        if is_ai_summarizer and hasattr(summarizer, 'is_cached'):
+            for i, turn in enumerate(turns):
+                if summarizer.is_cached(turn, detail_level, session_id):
+                    cached_turns.append(i)
                 else:
-                    summary = summarizer.summarize_turn(turn)
+                    uncached_turns.append(turn)
+                    uncached_indices.append(i)
+        else:
+            uncached_turns = turns
+            uncached_indices = list(range(len(turns)))
 
-                # Check for errors and fail fast
-                if summary.error:
-                    click.echo(f"Error: Failed to summarize turn: {summary.error}", err=True)
-                    sys.exit(1)
+        # Report cache status
+        if cached_turns:
+            console.print(f"[dim]Found {len(cached_turns)} cached summaries, generating {len(uncached_turns)} new[/dim]")
 
-                summaries.append(summary)
-                bar.update(1)
+        # Initialize timing estimator for progress tracking
+        from src.timing import TimingEstimator
+        timing = TimingEstimator()
+
+        # Calculate estimated durations only for uncached turns
+        if uncached_turns:
+            turn_estimates = [timing.estimate_turn_duration(turn) for turn in uncached_turns]
+            total_estimated = sum(turn_estimates)
+        else:
+            turn_estimates = []
+            total_estimated = 0
+
+        # Generate summaries
+        summaries = [None] * len(turns)  # Pre-allocate for correct ordering
+        import time
+
+        # First, quickly get cached summaries (no progress bar needed)
+        if is_ai_summarizer:
+            for i, turn in enumerate(turns):
+                if i in cached_turns:
+                    summary = summarizer.summarize_turn(turn, detail_level, session_id)
+                    summaries[i] = summary
+
+        # Then process uncached turns with progress display
+        if uncached_turns:
+            num_turns = len(uncached_turns)
+            use_full_progress = num_turns >= 3
+
+            if use_full_progress:
+                # Full progress bar for 3+ turns
+                progress = Progress(
+                    SpinnerColumn(),
+                    TextColumn("[bold blue]{task.description}", justify="left"),
+                    BarColumn(bar_width=30),
+                    TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+                    TextColumn("•"),
+                    TimeElapsedColumn(),
+                    TextColumn("/"),
+                    TimeRemainingColumn(),
+                    console=console,
+                    transient=False,
+                    refresh_per_second=4,  # Update display more frequently
+                )
+                progress.start()
+                task = progress.add_task(
+                    f"Summarizing {num_turns} turns",
+                    total=total_estimated if total_estimated > 0 else num_turns,
+                )
+            else:
+                # Simple spinner for small counts
+                progress = Progress(
+                    SpinnerColumn(),
+                    TextColumn("[bold blue]{task.description}"),
+                    TimeElapsedColumn(),
+                    console=console,
+                    transient=False,
+                    refresh_per_second=4,
+                )
+                progress.start()
+                task = progress.add_task(f"Summarizing {num_turns} turn{'s' if num_turns > 1 else ''}...")
+
+            try:
+                completed_time = 0.0
+                for j, (turn, orig_idx) in enumerate(zip(uncached_turns, uncached_indices)):
+                    if use_full_progress:
+                        # Update description with current turn number
+                        progress.update(task, description=f"Summarizing turn {j+1}/{num_turns}")
+
+                    # Time the summarization
+                    start_time = time.time()
+
+                    # Summarize
+                    if is_ai_summarizer:
+                        summary = summarizer.summarize_turn(turn, detail_level, session_id)
+                    else:
+                        summary = summarizer.summarize_turn(turn, session_id)
+
+                    elapsed = time.time() - start_time
+
+                    # Record timing for future estimates (only for AI summarizer, only for actual API calls)
+                    if is_ai_summarizer and elapsed > 0.5:  # Only record if it took real time (not cached)
+                        num_msgs, num_tools, content_len = timing.get_turn_features(turn)
+                        timing.add_sample(elapsed, num_msgs, num_tools, content_len)
+
+                    # Check for errors and fail fast
+                    if summary.error:
+                        progress.stop()
+                        click.echo(f"\nError: Failed to summarize turn: {summary.error}", err=True)
+                        sys.exit(1)
+
+                    summaries[orig_idx] = summary
+
+                    # Update progress using estimated time for this turn
+                    if use_full_progress:
+                        completed_time += turn_estimates[j] if turn_estimates else 1
+                        progress.update(task, completed=completed_time)
+            finally:
+                progress.stop()
+        else:
+            console.print("[green]All summaries loaded from cache[/green]")
         
+        # Capture output if summary generation is requested
+        import io
+        if generate_summary:
+            # Create a string buffer to capture output
+            output_buffer = io.StringIO()
+            actual_output = output_buffer
+        else:
+            actual_output = output_file
+
         # Format and output
         if output_format == 'terminal':
             formatter = TerminalFormatter(console)
             formatter.format_session_summary(turns, summaries, merged_session_metadata, include_metadata)
         elif output_format == 'plain':
             formatter = PlainFormatter(separator)
-            formatter.format_session_summary(turns, summaries, merged_session_metadata, include_metadata, output_file)
+            formatter.format_session_summary(turns, summaries, merged_session_metadata, include_metadata, actual_output)
         elif output_format == 'markdown':
             formatter = MarkdownFormatter()
-            formatter.format_session_summary(turns, summaries, merged_session_metadata, include_metadata, output_file)
+            formatter.format_session_summary(turns, summaries, merged_session_metadata, include_metadata, actual_output)
         elif output_format == 'jsonl':
             formatter = JSONLFormatter()
-            formatter.format_session_summary(turns, summaries, merged_session_metadata, include_metadata, output_file)
-        
+            formatter.format_session_summary(turns, summaries, merged_session_metadata, include_metadata, actual_output)
+
         # Report summary statistics
         total_tokens = sum(s.tokens_used or 0 for s in summaries)
         error_count = sum(1 for s in summaries if s.error)
-        
+
         if error_count > 0:
             click.echo(f"  ⚠️  {error_count} summaries failed")
         if total_tokens > 0:
             click.echo(f"  💰 Used {total_tokens} tokens")
         click.echo(f"  ✅ Processed {len(session_files)} sessions → {len(turns)} unique turns")
 
+        # Generate and output summary if requested
+        if generate_summary:
+            captured_content = output_buffer.getvalue()
 
+            # Determine which summary generator to use
+            if generate_summary == 'commit':
+                click.echo("\n" + "="*80, err=True)
+                click.echo("Generating conventional commit message...", err=True)
+                click.echo("="*80 + "\n", err=True)
+                summary_title = "CONVENTIONAL COMMIT MESSAGE"
+                generator = generate_commit_summary
+            elif generate_summary == 'requirements':
+                click.echo("\n" + "="*80, err=True)
+                click.echo("Extracting requirements from session...", err=True)
+                click.echo("="*80 + "\n", err=True)
+                summary_title = "EXTRACTED REQUIREMENTS"
+                generator = generate_requirements_summary
+            else:  # 'default'
+                click.echo("\n" + "="*80, err=True)
+                click.echo("Generating detailed work summary...", err=True)
+                click.echo("="*80 + "\n", err=True)
+                summary_title = "DETAILED WORK SUMMARY"
+                generator = generate_work_summary
 
-
-def format_messages_terminal(messages: list, session_metadata: dict, include_metadata: bool, no_truncate: bool = False):
-    """Format categorized messages for terminal display."""
-    from rich.panel import Panel
-    from rich.text import Text
-    from rich import box
-    from datetime import datetime
-    
-    # Session header
-    session_id = session_metadata.get('session_id', 'Unknown')[:8]
-    header_text = f"Messages from Session {session_id}... ({len(messages)} messages)"
-    
-    console.print(
-        Panel(
-            Text(header_text, style='bright_blue'),
-            box=box.ROUNDED,
-            border_style='blue',
-            padding=(0, 1)
-        )
-    )
-    console.print()
-    
-    # Display each message with category labels
-    for i, message in enumerate(messages, 1):
-        # Format timestamp if available and requested
-        timestamp_text = ""
-        if include_metadata and message.get('timestamp'):
             try:
-                dt = datetime.fromisoformat(message['timestamp'].replace('Z', '+00:00'))
-                timestamp_text = f" [{dt.strftime('%H:%M:%S')}]"
-            except:
-                pass
-        
-        # Create title with category (with better labels)
-        category = message['category']
-        if category == 'session_summary':
-            label = 'SUMMARY'
-        elif category == 'subagent':
-            label = 'SUBAGENT'
-        else:
-            label = category.upper()
-            
-        category_colors = {
-            'USER': 'bright_green',
-            'SUBAGENT': 'bright_yellow', 
-            'PLAN': 'bright_cyan',
-            'ASSISTANT': 'bright_magenta',
-            'SUMMARY': 'bright_blue'
-        }
-        category_color = category_colors.get(label, 'white')
-        
-        title = Text(f"[{label}] Message {i}", style=f"bold {category_color}")
-        if timestamp_text:
-            title.append(timestamp_text, style="dim white")
-        
-        content = message['content']
-        if not no_truncate and len(content) > 2000:
-            content = content[:2000] + "\n\n[... content truncated ...]"
-        
-        console.print(
-            Panel(
-                content,
-                title=title,
-                title_align="left",
-                border_style=category_color,
-                padding=(0, 1)
-            )
-        )
-        
-        if i < len(messages):
-            console.print()
+                summary_result = generator(captured_content, str(project_path))
+                # Output the original content first
+                output_file.write(captured_content)
+                # Then output the summary
+                output_file.write("\n\n" + "="*80 + "\n")
+                output_file.write(summary_title + "\n")
+                output_file.write("="*80 + "\n\n")
+                output_file.write(summary_result)
+                output_file.write("\n")
+            except Exception as e:
+                import traceback
+                click.echo(f"Error generating summary: {e}", err=True)
+                click.echo(traceback.format_exc(), err=True)
 
 
-def format_messages_markdown(messages: list, session_metadata: dict, include_metadata: bool, output_file, no_truncate: bool = False):
-    """Format categorized messages as Markdown."""
-    from datetime import datetime
-    
-    lines = []
-    session_id = session_metadata.get('session_id', 'Unknown')
-    
-    lines.append(f"# Messages from Session {session_id}")
-    lines.append("")
-    lines.append(f"**Session ID:** `{session_id}`")
-    lines.append(f"**Total Messages:** {len(messages)}")
-    lines.append("")
-    lines.append("---")
-    lines.append("")
-    
-    for i, message in enumerate(messages, 1):
-        category = message['category'].upper()
-        lines.append(f"## [{category}] Message {i}")
-        
-        if include_metadata and message.get('timestamp'):
-            try:
-                dt = datetime.fromisoformat(message['timestamp'].replace('Z', '+00:00'))
-                time_str = dt.strftime('%Y-%m-%d %H:%M:%S UTC')
-                lines.append(f"**Time:** {time_str}")
-            except:
-                pass
-            lines.append("")
-        
-        # Format content as blockquote
-        for line in message['content'].split('\n'):
-            lines.append(f"> {line}")
-        
-        lines.append("")
-        lines.append("---")
-        lines.append("")
-    
-    markdown_content = '\n'.join(lines)
-    if output_file:
-        output_file.write(markdown_content)
-
-
-def format_messages_jsonl(messages: list, session_metadata: dict, include_metadata: bool, output_file):
-    """Format categorized messages as JSONL."""
-    import json
-    from datetime import datetime
-    
-    lines = []
-    
-    # Header record
-    header_record = {
-        "type": "categorized_messages_session",
-        "session_id": session_metadata.get('session_id'),
-        "message_count": len(messages),
-        "timestamp": datetime.now().isoformat()
-    }
-    lines.append(json.dumps(header_record))
-    
-    # Message records
-    for message in messages:
-        message_record = {
-            "type": "categorized_message",
-            "number": message['number'],
-            "category": message['category'],
-            "content": message['content'],
-            "uuid": message['uuid']
-        }
-        
-        if include_metadata:
-            if message.get('timestamp'):
-                message_record["timestamp"] = message['timestamp']
-            if message.get('cwd'):
-                message_record["cwd"] = message['cwd']
-            if message.get('git_branch'):
-                message_record["git_branch"] = message['git_branch']
-        
-        lines.append(json.dumps(message_record))
-    
-    jsonl_content = '\n'.join(lines)
-    if output_file:
-        output_file.write(jsonl_content)
 
 
 if __name__ == '__main__':

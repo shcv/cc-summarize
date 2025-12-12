@@ -7,7 +7,7 @@ readme = {file = ["README.md"], content-type = "text/markdown"}
 
 [project]
 name = "cc-summarize"
-version = "1.0.1"
+version = "1.2.0"
 description = "A tool for managing, viewing, and summarizing Claude Code sessions"
 authors = [
     {name = "Claude Code User"}
@@ -26,11 +26,17 @@ classifiers = [
 ]
 dependencies = [
     "anthropic>=0.35.0",
-    "claude-code-sdk>=0.1.0",
+    "claude-agent-sdk>=0.1.0",
     "python-dotenv>=1.0.0",
     "rich>=13.0.0",
     "click>=8.1.0",
     "anyio>=4.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
 ]
 
 [project.scripts]
@@ -45,3 +51,10 @@ include = ["src*"]
 
 [tool.setuptools.package-data]
 "*" = ["*.md", "*.txt"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = "-v"
