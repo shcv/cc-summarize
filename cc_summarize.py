@@ -45,6 +45,7 @@ console = Console()
 @click.option('--project', '-p',
               default='.', help='Project directory - relative or absolute path (default: current)')
 @click.option('--session', '-s', help='Specific session ID to process')
+@click.option('--pick', '-S', is_flag=True, help='Interactively pick a session from a list')
 @click.option('--from-date', '--from', 'from_date', type=click.DateTime(formats=['%Y-%m-%d']),
               help='Start date filter (YYYY-MM-DD)')
 @click.option('--to-date', '--to', 'to_date', type=click.DateTime(formats=['%Y-%m-%d']),
@@ -74,7 +75,7 @@ console = Console()
 @click.option('--summary', type=click.Choice(['default', 'commit', 'requirements']),
               help='Generate a summary: default (session work), commit (conventional commit message), requirements (extract user requirements)')
 @click.version_option(version='1.2.0')
-def main(project, session, from_date, to_date, output_format, with_plans, with_summaries, with_subagent,
+def main(project, session, pick, from_date, to_date, output_format, with_plans, with_summaries, with_subagent,
          with_assistant, with_all, summarize, plain, separator, output, metadata, interactive, list_sessions,
          retry_failed, clear_cache, redo, verbose, no_truncate, since, summary):
     """Claude Code Session Summarizer
@@ -118,7 +119,14 @@ def main(project, session, from_date, to_date, output_format, with_plans, with_s
         if list_sessions:
             handle_list_sessions(project_path, from_date, to_date, actual_format, separator, output, verbose)
             return
-        
+
+        # Handle session picker
+        if pick:
+            picked_session = handle_pick_session(project_path, from_date, to_date)
+            if picked_session is None:
+                return  # User cancelled or no sessions
+            session = picked_session
+
         # Handle interactive mode
         if interactive:
             click.echo("Interactive mode not implemented yet.", err=True)
@@ -268,6 +276,65 @@ def handle_list_sessions(project_path: Path, from_date, to_date, output_format: 
     elif output_format == 'jsonl':
         formatter = JSONLFormatter()
         formatter.format_session_list(sessions, output_file, verbose)
+
+
+def handle_pick_session(project_path: Path, from_date, to_date) -> Optional[str]:
+    """Display session picker and return selected session ID."""
+    from src.utils import parse_iso_timestamp
+
+    sessions = list_sessions(str(project_path), from_date, to_date)
+
+    if not sessions:
+        click.echo(format_no_sessions_error(str(project_path)), err=True)
+        return None
+
+    if len(sessions) == 1:
+        # Only one session, use it directly
+        session_id = sessions[0].get('session_id', '')
+        click.echo(f"Using only available session: {session_id[:8]}", err=True)
+        return session_id
+
+    # Display numbered list
+    click.echo("\nSelect a session:", err=True)
+    click.echo("", err=True)
+
+    for i, session in enumerate(sessions, 1):
+        session_id = session.get('session_id', 'Unknown')
+        short_id = session_id.split('-')[0] if '-' in session_id else session_id[:8]
+
+        # Format date
+        last_modified = session.get('last_modified', '')
+        dt = parse_iso_timestamp(last_modified)
+        date_str = dt.strftime('%m-%d %H:%M') if dt else ''
+
+        # Get description, truncate for display
+        description = session.get('description', '')
+        max_desc_len = 50
+        if len(description) > max_desc_len:
+            description = description[:max_desc_len - 3] + '...'
+
+        click.echo(f"  {i:2}. {short_id}  {date_str}  {description}", err=True)
+
+    click.echo("", err=True)
+
+    # Get user input
+    while True:
+        try:
+            choice = click.prompt("Enter number (or q to quit)", default="1", err=True)
+            if choice.lower() in ('q', 'quit', 'exit'):
+                click.echo("Cancelled.", err=True)
+                return None
+
+            idx = int(choice) - 1
+            if 0 <= idx < len(sessions):
+                selected = sessions[idx]
+                session_id = selected.get('session_id', '')
+                click.echo(f"Selected: {session_id[:8]}", err=True)
+                return session_id
+            else:
+                click.echo(f"Please enter a number between 1 and {len(sessions)}", err=True)
+        except ValueError:
+            click.echo("Please enter a valid number or 'q' to quit", err=True)
 
 
 def handle_retry_failed(project_path: Path, session_id: str, detail_level: str) -> None:
