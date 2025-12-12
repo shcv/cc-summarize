@@ -145,9 +145,9 @@ def _run_ai_prompt(prompt: str, project_path: str) -> str:
     # Try SDK first (check if claude command exists)
     if shutil.which('claude'):
         try:
+            # Use -p for non-interactive prompt mode (doesn't create session files)
             result = subprocess.run(
-                ['claude'],
-                input=prompt,
+                ['claude', '-p', prompt],
                 capture_output=True,
                 text=True,
                 timeout=120
