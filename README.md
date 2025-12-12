@@ -2,6 +2,8 @@
 
 A CLI tool for managing, viewing, and summarizing Claude Code sessions.
 
+![Demo screenshot showing AI-powered session summaries](docs/images/demo-screenshot.png)
+
 ## Features
 
 - Extract and format Claude Code session messages
