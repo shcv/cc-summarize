@@ -8,12 +8,13 @@ A CLI tool for managing, viewing, and summarizing Claude Code sessions.
 
 ## Features
 
-- Extract and format Claude Code session messages
+- **Interactive session picker** (`--pick`): Select sessions from a list instead of copying UUIDs
+- **Session-level AI summaries** (`--summary`): Generate work summaries, commit messages, or requirements
+- **Per-turn AI summaries** (`--summarize`): Summarize assistant actions between user messages
 - Multiple output formats (terminal, plain, markdown, JSONL)
-- AI-powered summarization using Claude Agent SDK
 - Smart caching to avoid re-summarizing identical content
 - Date-based filtering and session management
-- Generate specialized summaries (commit messages, requirements extraction)
+- Filters out noise (warmup sessions, subagents, empty sessions)
 
 ## Installation
 
@@ -26,23 +27,29 @@ AI summarization uses the Claude Agent SDK. Ensure it's configured with your Ant
 ## Usage
 
 ```bash
-# List sessions for current project
+# List sessions for current project (with descriptions)
 cc-summarize --list
 
-# Show user messages only (default)
+# Interactive session picker
+cc-summarize --pick                  # pick a session, show user messages
+cc-summarize --pick --summary work   # pick a session, generate work summary
+
+# Session-level AI summaries (holistic summary of all work)
+cc-summarize --summary default       # detailed work summary
+cc-summarize --summary commit        # conventional commit message
+cc-summarize --summary requirements  # extract user requirements
+cc-summarize -S --summary work > summary.md  # redirect to file
+
+# Per-turn AI summaries (summarize each assistant response)
+cc-summarize --summarize normal
+cc-summarize --summarize detailed
+
+# Show user messages only (default, no AI)
 cc-summarize
 
 # Include additional message types
 cc-summarize --with-assistant --with-plans
 cc-summarize --with-all
-
-# Generate AI summaries (requires Claude Agent SDK)
-cc-summarize --summarize normal
-cc-summarize --summarize detailed
-
-# Generate specialized summaries
-cc-summarize --summary commit        # conventional commit from git diff
-cc-summarize --summary requirements  # extract user requirements
 
 # Filter by date
 cc-summarize --since 3d
