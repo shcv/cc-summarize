@@ -533,6 +533,157 @@ Be thorough but organized.
         
         return results
 
+    def generate_session_summary(
+        self,
+        turns: List[ConversationTurn],
+        summary_type: str = 'work'
+    ) -> str:
+        """Generate a high-level summary of an entire session.
+
+        Unlike summarize_turn which summarizes individual conversation turns,
+        this method creates a holistic summary of all work done across the session.
+
+        Args:
+            turns: All conversation turns in the session
+            summary_type: Type of summary to generate:
+                - 'work': Detailed summary of all work done
+                - 'commit': Conventional commit message for the changes
+                - 'requirements': Extract user requirements from the session
+
+        Returns:
+            Generated summary text
+        """
+        return anyio.run(self._generate_session_summary_async, turns, summary_type)
+
+    async def _generate_session_summary_async(
+        self,
+        turns: List[ConversationTurn],
+        summary_type: str
+    ) -> str:
+        """Async implementation of session summary generation."""
+        try:
+            from claude_agent_sdk import query, ClaudeAgentOptions
+
+            # Build comprehensive session content
+            session_content = self._build_session_content(turns)
+
+            # Get the appropriate prompt for the summary type
+            prompt = self._get_session_summary_prompt(summary_type, session_content)
+
+            # Configure SDK options with isolated config directory
+            options = ClaudeAgentOptions(
+                permission_mode='default',
+                env={'CLAUDE_CONFIG_DIR': str(self._claude_config_dir)}
+            )
+
+            # Collect response
+            response_parts = []
+            async for message in query(prompt=prompt, options=options):
+                text_content = self._extract_sdk_message_content(message)
+                if text_content:
+                    response_parts.append(text_content)
+
+            return ''.join(response_parts).strip()
+
+        except ImportError as e:
+            return f"Error: Claude Agent SDK not available: {e}"
+        except Exception as e:
+            return f"Error generating summary: {e}"
+
+    def _build_session_content(self, turns: List[ConversationTurn]) -> str:
+        """Build a comprehensive text representation of all session content."""
+        parts = []
+
+        for i, turn in enumerate(turns, 1):
+            parts.append(f"=== Turn {i} ===")
+
+            # User message
+            user_content = self._extract_message_content(turn.user_message)
+            if user_content:
+                parts.append(f"USER: {user_content}")
+
+            # Assistant actions - summarize tool calls
+            tool_summary = []
+            text_responses = []
+
+            for msg in turn.assistant_messages:
+                if msg.tool_name:
+                    tool_info = self._format_tool_call_for_prompt(msg.tool_name, msg.tool_args, 'normal')
+                    tool_summary.append(tool_info)
+                else:
+                    text = self._extract_message_content(msg)
+                    if text and len(text) > 50:  # Only substantial text
+                        text_responses.append(text[:500])  # Truncate long responses
+
+            if tool_summary:
+                parts.append(f"TOOLS USED: {'; '.join(tool_summary[:20])}")  # Limit tools shown
+                if len(tool_summary) > 20:
+                    parts.append(f"  ... and {len(tool_summary) - 20} more tool calls")
+
+            if text_responses:
+                parts.append(f"ASSISTANT RESPONSE: {text_responses[0][:300]}...")
+
+            parts.append("")
+
+        return '\n'.join(parts)
+
+    def _get_session_summary_prompt(self, summary_type: str, session_content: str) -> str:
+        """Get the prompt for a specific summary type."""
+        if summary_type == 'commit':
+            return f"""Analyze this Claude Code session and generate a conventional commit message for the work done.
+
+Session content:
+{session_content}
+
+Requirements:
+- Use conventional commit format: type(scope): description
+- Types: feat, fix, refactor, docs, test, chore, style, perf
+- Keep the first line under 72 characters
+- Add a blank line and bullet points for details if multiple changes
+- Focus on WHAT changed and WHY, not the mechanics of how
+- If multiple unrelated changes, use the most significant one for the title
+
+Generate ONLY the commit message, nothing else."""
+
+        elif summary_type == 'requirements':
+            return f"""Extract all user requirements from this Claude Code session.
+
+Session content:
+{session_content}
+
+Instructions:
+- List each requirement as a bullet point
+- Include explicit requirements (directly stated)
+- Include implicit requirements (inferred from corrections or follow-ups)
+- Note any requirements that were misunderstood and corrected
+- Group related requirements together
+- Be specific about what was requested
+
+Format your response as:
+## Explicit Requirements
+- [requirement]
+
+## Implicit/Corrected Requirements
+- [requirement with context]
+
+## Constraints/Preferences
+- [any stated preferences or constraints]"""
+
+        else:  # 'work' - default
+            return f"""Provide a detailed summary of all work done in this Claude Code session.
+
+Session content:
+{session_content}
+
+Focus on:
+- What features were implemented or bugs were fixed
+- What files were created or modified
+- Key technical decisions made
+- Any patterns or approaches used
+- Overall progress and outcomes
+
+Be comprehensive but concise. Use bullet points for clarity."""
+
 
 class SummarizerAvailability:
     """Helper class to check summarizer availability without importing the SDK."""

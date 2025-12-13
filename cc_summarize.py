@@ -29,11 +29,6 @@ from formatters import (
     PlainFormatter,
     should_use_plain_output,
 )
-from cli.summary_gen import (
-    generate_commit_summary,
-    generate_requirements_summary,
-    generate_work_summary,
-)
 
 # Load environment variables from .env file
 load_dotenv()
@@ -175,10 +170,15 @@ def main(project, session, pick, from_date, to_date, output_format, with_plans, 
                 click.echo(f"Error: {e}", err=True)
                 sys.exit(1)
 
-        # Main processing logic
+        # Handle --summary as a dedicated operation (session-level AI summary)
+        if summary:
+            handle_session_summary(project_path, session, from_date, to_date, since_date, summary)
+            return
+
+        # Main processing logic (message extraction or per-turn summarization)
         handle_summarization(
             project_path, session, from_date, to_date, detail_level, actual_format,
-            categories, separator, output, metadata, bool(summarize), no_truncate, since_date, redo, summary
+            categories, separator, output, metadata, bool(summarize), no_truncate, since_date, redo
         )
         
     except KeyboardInterrupt:
@@ -276,6 +276,91 @@ def handle_list_sessions(project_path: Path, from_date, to_date, output_format: 
     elif output_format == 'jsonl':
         formatter = JSONLFormatter()
         formatter.format_session_list(sessions, output_file, verbose)
+
+
+def handle_session_summary(
+    project_path: Path,
+    session_id: str,
+    from_date,
+    to_date,
+    since_date,
+    summary_type: str
+) -> None:
+    """Handle session-level AI summary generation.
+
+    This generates a holistic summary of all work in the session(s),
+    not per-turn summaries.
+
+    Args:
+        project_path: Path to the project
+        session_id: Optional specific session ID
+        from_date: Optional start date filter
+        to_date: Optional end date filter
+        since_date: Optional since date filter
+        summary_type: Type of summary ('default'/'work', 'commit', 'requirements')
+    """
+    from src.summarizer import Summarizer, SummarizerAvailability
+
+    # Check SDK availability
+    if not SummarizerAvailability.is_available():
+        error_msg = SummarizerAvailability.get_error_message()
+        click.echo(f"Error: {error_msg}", err=True)
+        sys.exit(1)
+
+    # Find sessions to process
+    if session_id:
+        session_file = find_session_by_id(str(project_path), session_id)
+        if not session_file:
+            click.echo(f"Session {session_id} not found.", err=True)
+            sys.exit(1)
+        session_files = [session_file]
+    else:
+        sessions = list_sessions(str(project_path), from_date, to_date)
+        if not sessions:
+            click.echo(format_no_sessions_error(str(project_path)), err=True)
+            return
+        session_files = [s.get('file_path') for s in sessions if s.get('file_path')]
+
+    if not session_files:
+        click.echo(format_no_sessions_error(str(project_path)), err=True)
+        return
+
+    # Parse sessions
+    parser = SessionParser()
+    click.echo(f"Processing {len(session_files)} session file(s)...", err=True)
+    messages = parser.parse_multiple_files(session_files)
+
+    # Apply since filter if specified
+    if since_date:
+        messages = filter_messages_since(messages, since_date)
+
+    turns = parser.build_conversation_turns(messages)
+
+    if not turns:
+        click.echo("No conversation turns found in the session(s).", err=True)
+        return
+
+    click.echo(f"Found {len(turns)} conversation turn(s)", err=True)
+
+    # Map summary type
+    if summary_type == 'default':
+        summary_type = 'work'
+
+    # Display summary type header
+    type_labels = {
+        'work': 'Work Summary',
+        'commit': 'Commit Message',
+        'requirements': 'Requirements'
+    }
+    label = type_labels.get(summary_type, 'Summary')
+    click.echo(f"\nGenerating {label}...\n", err=True)
+
+    # Generate summary using Summarizer
+    summarizer = Summarizer(project_path=str(project_path))
+    result = summarizer.generate_session_summary(turns, summary_type)
+
+    # Output the result
+    click.echo(result)
 
 
 def handle_pick_session(project_path: Path, from_date, to_date) -> Optional[str]:
@@ -389,7 +474,7 @@ def handle_summarization(
     project_path: Path, session_id: str, from_date, to_date, detail_level: str,
     output_format: str, categories: List[str], separator: str, output_file,
     include_metadata: bool, use_ai_summaries: bool = False, no_truncate: bool = False,
-    since_date = None, redo: bool = False, generate_summary: Optional[str] = None
+    since_date = None, redo: bool = False
 ) -> None:
     """Handle main summarization operations."""
 
@@ -469,69 +554,21 @@ def handle_summarization(
         extractor = MessageExtractor(no_truncate=no_truncate)
         messages = extractor.extract_messages(turns, categories)
 
-        # Capture output if summary generation is requested
-        import io
-        if generate_summary:
-            # Create a string buffer to capture output
-            output_buffer = io.StringIO()
-            actual_output = output_buffer
-        else:
-            actual_output = output_file
-
         if output_format == 'terminal':
             formatter = TerminalFormatter(console)
-            formatter.format_messages(messages, merged_session_metadata, include_metadata, actual_output)
+            formatter.format_messages(messages, merged_session_metadata, include_metadata, output_file)
         elif output_format == 'plain':
             formatter = PlainFormatter(separator)
-            formatter.format_messages(messages, merged_session_metadata, include_metadata, actual_output)
+            formatter.format_messages(messages, merged_session_metadata, include_metadata, output_file)
         elif output_format == 'markdown':
             formatter = MarkdownFormatter()
-            formatter.format_messages(messages, merged_session_metadata, include_metadata, actual_output)
+            formatter.format_messages(messages, merged_session_metadata, include_metadata, output_file)
         elif output_format == 'jsonl':
             formatter = JSONLFormatter()
-            formatter.format_messages(messages, merged_session_metadata, include_metadata, actual_output)
+            formatter.format_messages(messages, merged_session_metadata, include_metadata, output_file)
 
         category_summary = ', '.join(categories)
         click.echo(f"  ✅ Extracted {len(messages)} messages ({category_summary})")
-
-        # Generate and output summary if requested
-        if generate_summary:
-            captured_content = output_buffer.getvalue()
-
-            # Determine which summary generator to use
-            if generate_summary == 'commit':
-                click.echo("\n" + "="*80, err=True)
-                click.echo("Generating conventional commit message...", err=True)
-                click.echo("="*80 + "\n", err=True)
-                summary_title = "CONVENTIONAL COMMIT MESSAGE"
-                generator = generate_commit_summary
-            elif generate_summary == 'requirements':
-                click.echo("\n" + "="*80, err=True)
-                click.echo("Extracting requirements from session...", err=True)
-                click.echo("="*80 + "\n", err=True)
-                summary_title = "EXTRACTED REQUIREMENTS"
-                generator = generate_requirements_summary
-            else:  # 'default'
-                click.echo("\n" + "="*80, err=True)
-                click.echo("Generating detailed work summary...", err=True)
-                click.echo("="*80 + "\n", err=True)
-                summary_title = "DETAILED WORK SUMMARY"
-                generator = generate_work_summary
-
-            try:
-                summary_result = generator(captured_content, str(project_path))
-                # Output the original content first
-                output_file.write(captured_content)
-                # Then output the summary
-                output_file.write("\n\n" + "="*80 + "\n")
-                output_file.write(summary_title + "\n")
-                output_file.write("="*80 + "\n\n")
-                output_file.write(summary_result)
-                output_file.write("\n")
-            except Exception as e:
-                import traceback
-                click.echo(f"Error generating summary: {e}", err=True)
-                click.echo(traceback.format_exc(), err=True)
 
     elif extraction_mode == 'hybrid':
         # Hybrid mode: extract selected categories, summarize the rest
@@ -744,15 +781,6 @@ def handle_summarization(
                 progress.stop()
         else:
             console.print("[green]All summaries loaded from cache[/green]")
-        
-        # Capture output if summary generation is requested
-        import io
-        if generate_summary:
-            # Create a string buffer to capture output
-            output_buffer = io.StringIO()
-            actual_output = output_buffer
-        else:
-            actual_output = output_file
 
         # Format and output
         if output_format == 'terminal':
@@ -760,13 +788,13 @@ def handle_summarization(
             formatter.format_session_summary(turns, summaries, merged_session_metadata, include_metadata)
         elif output_format == 'plain':
             formatter = PlainFormatter(separator)
-            formatter.format_session_summary(turns, summaries, merged_session_metadata, include_metadata, actual_output)
+            formatter.format_session_summary(turns, summaries, merged_session_metadata, include_metadata, output_file)
         elif output_format == 'markdown':
             formatter = MarkdownFormatter()
-            formatter.format_session_summary(turns, summaries, merged_session_metadata, include_metadata, actual_output)
+            formatter.format_session_summary(turns, summaries, merged_session_metadata, include_metadata, output_file)
         elif output_format == 'jsonl':
             formatter = JSONLFormatter()
-            formatter.format_session_summary(turns, summaries, merged_session_metadata, include_metadata, actual_output)
+            formatter.format_session_summary(turns, summaries, merged_session_metadata, include_metadata, output_file)
 
         # Report summary statistics
         total_tokens = sum(s.tokens_used or 0 for s in summaries)
@@ -777,45 +805,6 @@ def handle_summarization(
         if total_tokens > 0:
             click.echo(f"  💰 Used {total_tokens} tokens")
         click.echo(f"  ✅ Processed {len(session_files)} sessions → {len(turns)} unique turns")
-
-        # Generate and output summary if requested
-        if generate_summary:
-            captured_content = output_buffer.getvalue()
-
-            # Determine which summary generator to use
-            if generate_summary == 'commit':
-                click.echo("\n" + "="*80, err=True)
-                click.echo("Generating conventional commit message...", err=True)
-                click.echo("="*80 + "\n", err=True)
-                summary_title = "CONVENTIONAL COMMIT MESSAGE"
-                generator = generate_commit_summary
-            elif generate_summary == 'requirements':
-                click.echo("\n" + "="*80, err=True)
-                click.echo("Extracting requirements from session...", err=True)
-                click.echo("="*80 + "\n", err=True)
-                summary_title = "EXTRACTED REQUIREMENTS"
-                generator = generate_requirements_summary
-            else:  # 'default'
-                click.echo("\n" + "="*80, err=True)
-                click.echo("Generating detailed work summary...", err=True)
-                click.echo("="*80 + "\n", err=True)
-                summary_title = "DETAILED WORK SUMMARY"
-                generator = generate_work_summary
-
-            try:
-                summary_result = generator(captured_content, str(project_path))
-                # Output the original content first
-                output_file.write(captured_content)
-                # Then output the summary
-                output_file.write("\n\n" + "="*80 + "\n")
-                output_file.write(summary_title + "\n")
-                output_file.write("="*80 + "\n\n")
-                output_file.write(summary_result)
-                output_file.write("\n")
-            except Exception as e:
-                import traceback
-                click.echo(f"Error generating summary: {e}", err=True)
-                click.echo(traceback.format_exc(), err=True)
 
 
 
