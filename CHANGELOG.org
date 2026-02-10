@@ -1,0 +1,66 @@
+* Changelog
+
+All notable changes to cc-summarize are documented in this file.
+
+** 1.4.0 - 2026-02-10
+
+*** Added
+- Org-mode output format (=--format org=)
+- Config file support (=~/.config/cc-summarize/config.toml=) for setting defaults
+- =--summary work= with date range support (replaces =--summary daily=)
+
+** 1.3.0 - 2025-12-12
+
+*** Added
+- =--pick= / =-S= flag for interactive session selection via fzf
+- Enhanced =--list= with session descriptions and filtering
+- =--summary= redesigned to use Summarizer class for all summary types
+
+*** Fixed
+- Isolate =--summary= sessions from user's Claude history
+- Use =claude -p= for non-interactive summary generation
+
+** 1.2.0 - 2025-12-11
+
+*** Added
+- =BaseFormatter= abstract class for consistent formatter interface
+- Shared utilities extracted into =src/utils/= (content, timestamp, formatting, tools)
+- Centralized configuration in =src/config.py=
+- CLI summary generators (=--summary commit=, =--summary requirements=)
+- Progress tracking with time estimates during summarization
+- Message timestamps display
+- Tests directory with utility tests
+
+*** Changed
+- *Breaking:* consolidated =sdk_summarizer.py= into unified =summarizer.py=
+- Unified formatter API across terminal/plain/markdown/jsonl
+- Improved cache handling with per-turn invalidation for =--redo=
+- Removed =--backend= flag
+
+** 1.0.1 - 2025-09-16
+
+*** Fixed
+- Remove overly aggressive length filtering on messages
+
+*** Changed
+- Add README and update license to CC0
+
+** 1.0.0 - 2025-09-15
+
+*** Added
+- Claude Agent SDK integration for AI-powered summarization
+- =--since= flag for time-based message filtering
+- =--redo= flag for regenerating cached summaries
+- Multiple output formats: terminal, plain, markdown, jsonl
+- Summary caching to avoid redundant API calls
+
+*** Fixed
+- Message filtering and conversation turn building to eliminate noise
+- Summarization output quality by filtering tool responses and system messages
+
+** 0.1.0 - 2025-09-13
+
+- Initial release
+- JSONL session file parsing
+- Basic message display with type categorization
+- Content truncation for readability
