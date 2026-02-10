@@ -31,14 +31,39 @@ from formatters import (
     MarkdownFormatter,
     JSONLFormatter,
     PlainFormatter,
+    OrgFormatter,
     should_use_plain_output,
 )
+from config import load_user_config
 
 # Load environment variables from .env file
 load_dotenv()
 
 # Initialize console for rich output
 console = Console()
+
+
+def create_formatter(output_format: str, separator: str = None):
+    """Create a formatter instance for the given format name."""
+    if output_format == 'terminal':
+        return TerminalFormatter(console)
+    elif output_format == 'plain':
+        return PlainFormatter(separator)
+    elif output_format == 'markdown':
+        return MarkdownFormatter()
+    elif output_format == 'org':
+        return OrgFormatter()
+    elif output_format == 'jsonl':
+        return JSONLFormatter()
+    else:
+        raise ValueError(f"Unknown format: {output_format}")
+
+
+def _apply_config_defaults(ctx, param, value):
+    """Click callback to apply config file defaults for unset parameters."""
+    # This is called per-parameter; we apply all defaults once via context
+    return value
+
 
 @click.command()
 @click.option('--project', '-p',
@@ -49,7 +74,7 @@ console = Console()
               help='Start date filter (YYYY-MM-DD)')
 @click.option('--to-date', '--to', 'to_date', type=click.DateTime(formats=['%Y-%m-%d']),
               help='End date filter (YYYY-MM-DD)')
-@click.option('--format', 'output_format', type=click.Choice(['auto', 'terminal', 'markdown', 'jsonl', 'plain']), 
+@click.option('--format', 'output_format', type=click.Choice(['auto', 'terminal', 'markdown', 'org', 'jsonl', 'plain']),
               default='auto', help='Output format (auto detects plain when piping)')
 @click.option('--with-plans', is_flag=True, help='Include assistant plan responses')
 @click.option('--with-summaries', is_flag=True, help='Include session summary messages')
@@ -77,13 +102,72 @@ console = Console()
 @click.option('--date', 'summary_date',
               help='Date for --summary work (YYYY-MM-DD or -1d for yesterday, -2w for 2 weeks ago)')
 @click.version_option(version='1.2.0')
-def main(project, session, pick, from_date, to_date, output_format, with_plans, with_summaries, with_subagent,
+@click.pass_context
+def main(ctx, project, session, pick, from_date, to_date, output_format, with_plans, with_summaries, with_subagent,
          with_assistant, with_all, summarize, plain, separator, output, metadata, interactive, list_sessions,
          retry_failed, clear_cache, redo, verbose, no_truncate, since, summary, all_projects, summary_date):
     """Claude Code Session Summarizer
 
     Manage, view, and summarize Claude Code sessions for a project.
     """
+
+    # Apply config file defaults for parameters the user didn't explicitly set
+    user_config = load_user_config()
+    # Map config keys to Click parameter names
+    config_param_map = {
+        'format': 'output_format',
+        'output_format': 'output_format',
+        'plain': 'plain',
+        'separator': 'separator',
+        'metadata': 'metadata',
+        'verbose': 'verbose',
+        'no_truncate': 'no_truncate',
+        'with_plans': 'with_plans',
+        'with_summaries': 'with_summaries',
+        'with_subagent': 'with_subagent',
+        'with_assistant': 'with_assistant',
+        'with_all': 'with_all',
+        'summarize': 'summarize',
+        'since': 'since',
+        'all_projects': 'all_projects',
+        'project': 'project',
+    }
+    # Get the set of parameters explicitly provided on the command line
+    provided = {p.name for p in ctx.command.params if ctx.get_parameter_source(p.name) not in (None, click.core.ParameterSource.DEFAULT)}
+    for config_key, param_name in config_param_map.items():
+        if config_key in user_config and param_name not in provided:
+            locals_val = user_config[config_key]
+            # Assign to local variables
+            if param_name == 'output_format':
+                output_format = locals_val
+            elif param_name == 'plain':
+                plain = locals_val
+            elif param_name == 'separator':
+                separator = locals_val
+            elif param_name == 'metadata':
+                metadata = locals_val
+            elif param_name == 'verbose':
+                verbose = locals_val
+            elif param_name == 'no_truncate':
+                no_truncate = locals_val
+            elif param_name == 'with_plans':
+                with_plans = locals_val
+            elif param_name == 'with_summaries':
+                with_summaries = locals_val
+            elif param_name == 'with_subagent':
+                with_subagent = locals_val
+            elif param_name == 'with_assistant':
+                with_assistant = locals_val
+            elif param_name == 'with_all':
+                with_all = locals_val
+            elif param_name == 'summarize':
+                summarize = locals_val
+            elif param_name == 'since':
+                since = locals_val
+            elif param_name == 'all_projects':
+                all_projects = locals_val
+            elif param_name == 'project':
+                project = locals_val
 
     # Handle project path - support both relative and absolute paths
     # Convert to absolute path even if directory doesn't exist
@@ -92,7 +176,7 @@ def main(project, session, pick, from_date, to_date, output_format, with_plans, 
     else:
         project_path = Path.cwd() / project
     project_path = project_path.resolve()
-    
+
     # Determine actual output format
     actual_format = output_format
     if output_format == 'auto':
@@ -106,8 +190,8 @@ def main(project, session, pick, from_date, to_date, output_format, with_plans, 
             click.echo("Error: Cannot use --redo and --clear-cache together. Use one or the other.", err=True)
             sys.exit(1)
 
-        if redo and not summarize:
-            click.echo("Error: --redo flag requires --summarize option (nothing to regenerate without AI summaries).", err=True)
+        if redo and not summarize and not summary:
+            click.echo("Error: --redo flag requires --summarize or --summary option (nothing to regenerate without AI summaries).", err=True)
             sys.exit(1)
 
         # Handle cache operations first
@@ -180,9 +264,9 @@ def main(project, session, pick, from_date, to_date, output_format, with_plans, 
         # Handle --summary as a dedicated operation (session-level AI summary)
         if summary:
             if summary == 'work':
-                handle_work_summary(project_path, all_projects, summary_date, since_date)
+                handle_work_summary(project_path, all_projects, summary_date, since_date, actual_format, redo)
             else:
-                handle_session_summary(project_path, session, from_date, to_date, since_date, summary)
+                handle_session_summary(project_path, session, from_date, to_date, since_date, summary, actual_format)
             return
 
         # Main processing logic (message extraction or per-turn summarization)
@@ -266,25 +350,13 @@ def handle_list_sessions(project_path: Path, from_date, to_date, output_format: 
     """Handle session listing operations."""
     sessions = list_sessions(str(project_path), from_date, to_date)
     
+    formatter = create_formatter(output_format, separator)
     if output_format == 'terminal':
-        formatter = TerminalFormatter(console)
         formatter.format_session_list(sessions, verbose)
-        
-        # Also show cache stats
         cache = SummaryCache()
         stats = cache.get_cache_stats()
         formatter.format_cache_stats(stats)
-        
-    elif output_format == 'plain':
-        formatter = PlainFormatter(separator)
-        formatter.format_session_list(sessions, output_file, verbose)
-        
-    elif output_format == 'markdown':
-        formatter = MarkdownFormatter()
-        formatter.format_session_list(sessions, output_file, verbose)
-        
-    elif output_format == 'jsonl':
-        formatter = JSONLFormatter()
+    else:
         formatter.format_session_list(sessions, output_file, verbose)
 
 
@@ -294,7 +366,8 @@ def handle_session_summary(
     from_date,
     to_date,
     since_date,
-    summary_type: str
+    summary_type: str,
+    output_format: str = 'markdown'
 ) -> None:
     """Handle session-level AI summary generation.
 
@@ -308,6 +381,7 @@ def handle_session_summary(
         to_date: Optional end date filter
         since_date: Optional since date filter
         summary_type: Type of summary ('default'/'work', 'commit', 'requirements')
+        output_format: Output format ('markdown', 'org', etc.)
     """
     from src.summarizer import Summarizer, SummarizerAvailability
 
@@ -367,7 +441,7 @@ def handle_session_summary(
 
     # Generate summary using Summarizer
     summarizer = Summarizer(project_path=str(project_path))
-    result = summarizer.generate_session_summary(turns, summary_type)
+    result = summarizer.generate_session_summary(turns, summary_type, output_format)
 
     # Output the result
     click.echo(result)
@@ -377,7 +451,9 @@ def handle_work_summary(
     project_path: Path,
     all_projects: bool,
     end_date,
-    since_date
+    since_date,
+    output_format: str = 'markdown',
+    redo: bool = False
 ) -> None:
     """Handle work summary generation for a time range.
 
@@ -386,6 +462,8 @@ def handle_work_summary(
         all_projects: Whether to summarize across all projects
         end_date: End date for the range (None = today)
         since_date: Start of the range (None = start of end_date)
+        output_format: Output format ('markdown', 'org', etc.)
+        redo: Whether to bypass cache and regenerate
     """
     from src.summarizer import Summarizer, SummarizerAvailability
     from src.git import get_daily_git_summary, format_git_summary, get_project_display_name
@@ -516,7 +594,9 @@ def handle_work_summary(
     # Generate summary with date range info
     range_key = f"{start_str}_to_{end_str}"
     summarizer = Summarizer(project_path=str(project_path))
-    result = summarizer.generate_work_summary(project_sessions, range_key=range_key)
+    result = summarizer.generate_work_summary(project_sessions, range_key=range_key, output_format=output_format, skip_cache=redo)
+    if redo:
+        click.echo("(--redo: bypassed cache)", err=True)
 
     # Output the result
     click.echo(result)
@@ -713,18 +793,8 @@ def handle_summarization(
         extractor = MessageExtractor(no_truncate=no_truncate)
         messages = extractor.extract_messages(turns, categories)
 
-        if output_format == 'terminal':
-            formatter = TerminalFormatter(console)
-            formatter.format_messages(messages, merged_session_metadata, include_metadata, output_file)
-        elif output_format == 'plain':
-            formatter = PlainFormatter(separator)
-            formatter.format_messages(messages, merged_session_metadata, include_metadata, output_file)
-        elif output_format == 'markdown':
-            formatter = MarkdownFormatter()
-            formatter.format_messages(messages, merged_session_metadata, include_metadata, output_file)
-        elif output_format == 'jsonl':
-            formatter = JSONLFormatter()
-            formatter.format_messages(messages, merged_session_metadata, include_metadata, output_file)
+        formatter = create_formatter(output_format, separator)
+        formatter.format_messages(messages, merged_session_metadata, include_metadata, output_file)
 
         category_summary = ', '.join(categories)
         click.echo(f"  ✅ Extracted {len(messages)} messages ({category_summary})")
@@ -775,36 +845,16 @@ def handle_summarization(
                 entry['number'] = i
 
             # Display the hybrid result
-            if output_format == 'terminal':
-                formatter = TerminalFormatter(console)
-                formatter.format_messages(all_entries, merged_session_metadata, include_metadata, output_file)
-            elif output_format == 'plain':
-                formatter = PlainFormatter(separator)
-                formatter.format_messages(all_entries, merged_session_metadata, include_metadata, output_file)
-            elif output_format == 'markdown':
-                formatter = MarkdownFormatter()
-                formatter.format_messages(all_entries, merged_session_metadata, include_metadata, output_file)
-            elif output_format == 'jsonl':
-                formatter = JSONLFormatter()
-                formatter.format_messages(all_entries, merged_session_metadata, include_metadata, output_file)
+            formatter = create_formatter(output_format, separator)
+            formatter.format_messages(all_entries, merged_session_metadata, include_metadata, output_file)
 
             category_summary = ', '.join(categories)
             summary_summary = ', '.join(categories_to_summarize)
             click.echo(f"  ✅ Hybrid mode: Extracted {len(extracted_messages)} messages ({category_summary}), Summarized {len(summary_entries)} blocks ({summary_summary})")
         else:
             # No categories to summarize, fall back to pure extraction
-            if output_format == 'terminal':
-                formatter = TerminalFormatter(console)
-                formatter.format_messages(extracted_messages, merged_session_metadata, include_metadata, output_file)
-            elif output_format == 'plain':
-                formatter = PlainFormatter(separator)
-                formatter.format_messages(extracted_messages, merged_session_metadata, include_metadata, output_file)
-            elif output_format == 'markdown':
-                formatter = MarkdownFormatter()
-                formatter.format_messages(extracted_messages, merged_session_metadata, include_metadata, output_file)
-            elif output_format == 'jsonl':
-                formatter = JSONLFormatter()
-                formatter.format_messages(extracted_messages, merged_session_metadata, include_metadata, output_file)
+            formatter = create_formatter(output_format, separator)
+            formatter.format_messages(extracted_messages, merged_session_metadata, include_metadata, output_file)
 
             category_summary = ', '.join(categories)
             click.echo(f"  ✅ Extracted {len(extracted_messages)} messages ({category_summary})")
@@ -942,17 +992,10 @@ def handle_summarization(
             console.print("[green]All summaries loaded from cache[/green]")
 
         # Format and output
+        formatter = create_formatter(output_format, separator)
         if output_format == 'terminal':
-            formatter = TerminalFormatter(console)
             formatter.format_session_summary(turns, summaries, merged_session_metadata, include_metadata)
-        elif output_format == 'plain':
-            formatter = PlainFormatter(separator)
-            formatter.format_session_summary(turns, summaries, merged_session_metadata, include_metadata, output_file)
-        elif output_format == 'markdown':
-            formatter = MarkdownFormatter()
-            formatter.format_session_summary(turns, summaries, merged_session_metadata, include_metadata, output_file)
-        elif output_format == 'jsonl':
-            formatter = JSONLFormatter()
+        else:
             formatter.format_session_summary(turns, summaries, merged_session_metadata, include_metadata, output_file)
 
         # Report summary statistics

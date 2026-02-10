@@ -22,6 +22,26 @@ except ImportError:
     from git import get_project_display_name
 
 
+def _heading(level: int, text: str, output_format: str = 'markdown') -> str:
+    """Generate a heading in the appropriate format."""
+    if output_format == 'org':
+        return '*' * level + ' ' + text
+    return '#' * level + ' ' + text
+
+
+def _format_instructions_for(output_format: str) -> str:
+    """Return formatting instructions for AI prompts based on output format."""
+    if output_format == 'org':
+        return """IMPORTANT: Output MUST use Emacs org-mode syntax, NOT markdown.
+- Headings: use * for level 1, ** for level 2, *** for level 3 (NOT # or ##)
+- Bold: *bold* is fine (ensure a space before the opening * so it isn't parsed as a heading)
+- Italic: use /italic/ (NOT *italic*)
+- Code/filenames: use ~code~ (NOT `code`)
+- Lists: use - or + for unordered lists. NEVER use * for list items (it creates headings in org-mode)
+- Do NOT use any markdown syntax (no ##, no **bold**, no `code`, no * list items)"""
+    return ""
+
+
 def get_data_dir() -> Path:
     """Get XDG data directory for cc-summarize."""
     xdg_data = os.environ.get('XDG_DATA_HOME', os.path.expanduser('~/.local/share'))
@@ -538,7 +558,8 @@ Be thorough but organized.
     def generate_session_summary(
         self,
         turns: List[ConversationTurn],
-        summary_type: str = 'work'
+        summary_type: str = 'work',
+        output_format: str = 'markdown'
     ) -> str:
         """Generate a high-level summary of an entire session.
 
@@ -551,16 +572,18 @@ Be thorough but organized.
                 - 'work': Detailed summary of all work done
                 - 'commit': Conventional commit message for the changes
                 - 'requirements': Extract user requirements from the session
+            output_format: Output format ('markdown', 'org', etc.)
 
         Returns:
             Generated summary text
         """
-        return anyio.run(self._generate_session_summary_async, turns, summary_type)
+        return anyio.run(self._generate_session_summary_async, turns, summary_type, output_format)
 
     async def _generate_session_summary_async(
         self,
         turns: List[ConversationTurn],
-        summary_type: str
+        summary_type: str,
+        output_format: str = 'markdown'
     ) -> str:
         """Async implementation of session summary generation."""
         try:
@@ -570,7 +593,7 @@ Be thorough but organized.
             session_content = self._build_session_content(turns)
 
             # Get the appropriate prompt for the summary type
-            prompt = self._get_session_summary_prompt(summary_type, session_content)
+            prompt = self._get_session_summary_prompt(summary_type, session_content, output_format)
 
             # Configure SDK options with isolated config directory
             options = ClaudeAgentOptions(
@@ -629,8 +652,11 @@ Be thorough but organized.
 
         return '\n'.join(parts)
 
-    def _get_session_summary_prompt(self, summary_type: str, session_content: str) -> str:
+    def _get_session_summary_prompt(self, summary_type: str, session_content: str, output_format: str = 'markdown') -> str:
         """Get the prompt for a specific summary type."""
+        fmt_instructions = _format_instructions_for(output_format)
+        h2 = lambda text: _heading(2, text, output_format)
+
         if summary_type == 'commit':
             return f"""Analyze this Claude Code session and generate a conventional commit message for the work done.
 
@@ -648,7 +674,9 @@ Requirements:
 Generate ONLY the commit message, nothing else."""
 
         elif summary_type == 'requirements':
-            return f"""Extract all user requirements from this Claude Code session.
+            return f"""{fmt_instructions}
+
+Extract all user requirements from this Claude Code session.
 
 Session content:
 {session_content}
@@ -662,17 +690,19 @@ Instructions:
 - Be specific about what was requested
 
 Format your response as:
-## Explicit Requirements
+{h2('Explicit Requirements')}
 - [requirement]
 
-## Implicit/Corrected Requirements
+{h2('Implicit/Corrected Requirements')}
 - [requirement with context]
 
-## Constraints/Preferences
+{h2('Constraints/Preferences')}
 - [any stated preferences or constraints]"""
 
         elif summary_type == 'daily':
-            return f"""Summarize all work accomplished in this Claude Code session for a daily standup or log.
+            return f"""{fmt_instructions}
+
+Summarize all work accomplished in this Claude Code session for a daily standup or log.
 
 Session content:
 {session_content}
@@ -686,17 +716,19 @@ Instructions:
 - Format as bullet points
 
 Structure your response as:
-## Completed
+{h2('Completed')}
 - [what was accomplished]
 
-## In Progress (if applicable)
+{h2('In Progress')} (if applicable)
 - [work started but not finished]
 
-## Notes (if applicable)
+{h2('Notes')} (if applicable)
 - [any blockers, decisions, or things to remember]"""
 
         else:  # 'work' - default
-            return f"""Provide a detailed summary of all work done in this Claude Code session.
+            return f"""{fmt_instructions}
+
+Provide a detailed summary of all work done in this Claude Code session.
 
 Session content:
 {session_content}
@@ -716,7 +748,8 @@ Be comprehensive but concise. Use bullet points for clarity."""
         project_sessions: list,
         git_data: dict = None,
         progress_callback=None,
-        date_str: str = None
+        date_str: str = None,
+        output_format: str = 'markdown'
     ) -> str:
         """Generate a summary of all work done across projects for a day.
 
@@ -730,6 +763,7 @@ Be comprehensive but concise. Use bullet points for clarity."""
             git_data: Optional dict mapping project_path to git summary data
             progress_callback: Optional callback(project_name, completed, total) for progress
             date_str: Date string (YYYY-MM-DD) for cache key
+            output_format: Output format ('markdown', 'org', etc.)
 
         Returns:
             Generated daily summary text
@@ -739,14 +773,17 @@ Be comprehensive but concise. Use bullet points for clarity."""
             project_sessions,
             git_data,
             progress_callback,
-            date_str
+            date_str,
+            output_format
         )
 
     def generate_work_summary(
         self,
         project_sessions: list,
         range_key: str = None,
-        progress_callback=None
+        progress_callback=None,
+        output_format: str = 'markdown',
+        skip_cache: bool = False
     ) -> str:
         """Generate a summary of work done across projects for a time range.
 
@@ -754,6 +791,8 @@ Be comprehensive but concise. Use bullet points for clarity."""
             project_sessions: List of tuples (project_path, turns, git_summary)
             range_key: Cache key for the date range (e.g., "2024-01-01_to_2024-01-07")
             progress_callback: Optional callback for progress updates
+            output_format: Output format ('markdown', 'org', etc.)
+            skip_cache: Whether to bypass cache and regenerate
 
         Returns:
             Generated work summary text
@@ -762,7 +801,9 @@ Be comprehensive but concise. Use bullet points for clarity."""
             self._generate_work_summary_async,
             project_sessions,
             range_key,
-            progress_callback
+            progress_callback,
+            output_format,
+            skip_cache
         )
 
     def _compute_turns_hash(self, turns: List[ConversationTurn]) -> str:
@@ -843,7 +884,9 @@ Be comprehensive but concise. Use bullet points for clarity."""
         project_path: str,
         turns: List[ConversationTurn],
         git_data: dict = None,
-        date_str: str = None
+        date_str: str = None,
+        output_format: str = 'markdown',
+        skip_cache: bool = False
     ) -> str:
         """Generate a daily summary for a single project.
 
@@ -861,8 +904,8 @@ Be comprehensive but concise. Use bullet points for clarity."""
         turns_hash = self._compute_turns_hash(turns)
 
         # Check cache first
-        if date_str:
-            cached = self.cache.get_daily_summary(project_path, date_str, turns_hash)
+        if date_str and not skip_cache:
+            cached = self.cache.get_daily_summary(project_path, date_str, turns_hash, output_format)
             if cached:
                 return cached
 
@@ -887,7 +930,10 @@ Be comprehensive but concise. Use bullet points for clarity."""
         turn_content = '\n'.join(content_parts)
 
         # Single AI call to compile into project summary
-        prompt = f"""Summarize the work done in the "{project_name}" project based on these conversation excerpts.
+        fmt_instructions = _format_instructions_for(output_format)
+        prompt = f"""{fmt_instructions}
+
+Summarize the work done in the "{project_name}" project based on these conversation excerpts.
 
 {turn_content}
 
@@ -898,7 +944,9 @@ Instructions:
 - Use past tense (e.g., "Implemented...", "Fixed...", "Added...")
 - Include git stats if relevant
 
-Output ONLY the bullet points, no headers or extra text."""
+Output ONLY the bullet points (using - as the list marker), no headers or extra text. Example:
+- Implemented feature X for Y
+- Fixed bug in Z that caused W"""
 
         options = ClaudeAgentOptions(
             permission_mode='default',
@@ -915,7 +963,7 @@ Output ONLY the bullet points, no headers or extra text."""
 
         # Cache the result
         if date_str:
-            self.cache.store_daily_summary(project_path, date_str, turns_hash, summary)
+            self.cache.store_daily_summary(project_path, date_str, turns_hash, summary, output_format)
 
         return summary
 
@@ -924,7 +972,8 @@ Output ONLY the bullet points, no headers or extra text."""
         project_sessions: list,
         git_data: dict = None,
         progress_callback=None,
-        date_str: str = None
+        date_str: str = None,
+        output_format: str = 'markdown'
     ) -> str:
         """Generate daily summary by combining per-project summaries.
 
@@ -939,7 +988,7 @@ Output ONLY the bullet points, no headers or extra text."""
             # Generate per-project daily summaries in parallel
             async def summarize_one_project(project_path, turns, project_git):
                 summary = await self._summarize_project_daily_async(
-                    project_path, turns, project_git, date_str
+                    project_path, turns, project_git, date_str, output_format
                 )
                 return project_path, summary
 
@@ -951,7 +1000,7 @@ Output ONLY the bullet points, no headers or extra text."""
             results = await asyncio.gather(*tasks, return_exceptions=True)
 
             # Phase 3: Combine project summaries (no AI needed)
-            output_parts = ["# Daily Summary", ""]
+            output_parts = [_heading(1, "Daily Summary", output_format), ""]
 
             for result in results:
                 if isinstance(result, Exception):
@@ -959,7 +1008,7 @@ Output ONLY the bullet points, no headers or extra text."""
                 project_path, summary = result
                 project_name = get_project_display_name(project_path)
 
-                output_parts.append(f"## {project_name}")
+                output_parts.append(_heading(2, project_name, output_format))
                 output_parts.append(summary)
                 output_parts.append("")
 
@@ -974,7 +1023,9 @@ Output ONLY the bullet points, no headers or extra text."""
         self,
         project_sessions: list,
         range_key: str = None,
-        progress_callback=None
+        progress_callback=None,
+        output_format: str = 'markdown',
+        skip_cache: bool = False
     ) -> str:
         """Generate work summary by combining per-project summaries.
 
@@ -986,7 +1037,7 @@ Output ONLY the bullet points, no headers or extra text."""
             # Generate per-project summaries in parallel
             async def summarize_one_project(project_path, turns, project_git):
                 summary = await self._summarize_project_daily_async(
-                    project_path, turns, project_git, range_key
+                    project_path, turns, project_git, range_key, output_format, skip_cache
                 )
                 return project_path, summary
 
@@ -998,7 +1049,7 @@ Output ONLY the bullet points, no headers or extra text."""
             results = await asyncio.gather(*tasks, return_exceptions=True)
 
             # Combine project summaries (no AI needed)
-            output_parts = ["# Work Summary", ""]
+            output_parts = [_heading(1, "Work Summary", output_format), ""]
 
             for result in results:
                 if isinstance(result, Exception):
@@ -1006,7 +1057,7 @@ Output ONLY the bullet points, no headers or extra text."""
                 project_path, summary = result
                 project_name = get_project_display_name(project_path)
 
-                output_parts.append(f"## {project_name}")
+                output_parts.append(_heading(2, project_name, output_format))
                 output_parts.append(summary)
                 output_parts.append("")
 

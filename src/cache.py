@@ -255,18 +255,21 @@ class SummaryCache:
             )
         }
 
-    def _get_daily_cache_key(self, project_path: str, date_str: str, turns_hash: str) -> str:
+    def _get_daily_cache_key(self, project_path: str, date_str: str, turns_hash: str, output_format: str = 'markdown') -> str:
         """Generate cache key for a daily project summary."""
         # Normalize project path to avoid issues with trailing slashes
         project_name = Path(project_path).name
         project_hash = self._hash_content(project_path)[:8]
-        return f"daily_{project_name}_{project_hash}_{date_str}_{turns_hash}"
+        # Include output format so markdown and org summaries are cached separately
+        fmt_suffix = f"_{output_format}" if output_format != 'markdown' else ''
+        return f"daily_{project_name}_{project_hash}_{date_str}_{turns_hash}{fmt_suffix}"
 
     def get_daily_summary(
         self,
         project_path: str,
         date_str: str,
-        turns_hash: str
+        turns_hash: str,
+        output_format: str = 'markdown'
     ) -> Optional[str]:
         """Retrieve cached daily summary for a project if it exists.
 
@@ -274,11 +277,12 @@ class SummaryCache:
             project_path: Path to the project
             date_str: Date string (YYYY-MM-DD)
             turns_hash: Hash of the turn content for cache invalidation
+            output_format: Output format for cache key differentiation
 
         Returns:
             Cached summary text or None
         """
-        cache_key = self._get_daily_cache_key(project_path, date_str, turns_hash)
+        cache_key = self._get_daily_cache_key(project_path, date_str, turns_hash, output_format)
         cache_path = self.daily_dir / f"{cache_key}.json"
 
         if cache_path.exists():
@@ -296,7 +300,8 @@ class SummaryCache:
         project_path: str,
         date_str: str,
         turns_hash: str,
-        summary: str
+        summary: str,
+        output_format: str = 'markdown'
     ) -> None:
         """Store a daily summary in cache.
 
@@ -305,8 +310,9 @@ class SummaryCache:
             date_str: Date string (YYYY-MM-DD)
             turns_hash: Hash of the turn content
             summary: The generated summary text
+            output_format: Output format for cache key differentiation
         """
-        cache_key = self._get_daily_cache_key(project_path, date_str, turns_hash)
+        cache_key = self._get_daily_cache_key(project_path, date_str, turns_hash, output_format)
         cache_path = self.daily_dir / f"{cache_key}.json"
 
         data = {

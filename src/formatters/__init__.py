@@ -5,6 +5,7 @@ from .terminal import TerminalFormatter
 from .plain import PlainFormatter, should_use_plain_output
 from .markdown import MarkdownFormatter
 from .jsonl import JSONLFormatter
+from .org import OrgFormatter
 
 __all__ = [
     'BaseFormatter',
@@ -12,5 +13,6 @@ __all__ = [
     'PlainFormatter',
     'MarkdownFormatter',
     'JSONLFormatter',
+    'OrgFormatter',
     'should_use_plain_output',
 ]

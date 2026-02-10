@@ -15,6 +15,13 @@ def _get_config_path() -> Path:
 def load_user_config() -> dict:
     """Load user configuration from ~/.config/cc-summarize/config.json.
 
+    Supports all CLI parameters as defaults. Config keys use underscores
+    (matching Click parameter names). CLI flags use their Click names:
+
+        format, plain, separator, metadata, verbose, no_truncate,
+        with_plans, with_summaries, with_subagent, with_assistant, with_all,
+        summarize, since, all_projects, output, day_start_hour
+
     Returns a dict with defaults filled in for missing keys.
     """
     defaults = {
