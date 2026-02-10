@@ -79,8 +79,10 @@ class SummaryCache:
         # Create subdirectories for organization
         self.summaries_dir = self.cache_dir / 'summaries'
         self.errors_dir = self.cache_dir / 'errors'
+        self.daily_dir = self.cache_dir / 'daily'
         self.summaries_dir.mkdir(exist_ok=True)
         self.errors_dir.mkdir(exist_ok=True)
+        self.daily_dir.mkdir(exist_ok=True)
     
     def _hash_content(self, content: str) -> str:
         """Create hash of content for cache key."""
@@ -246,8 +248,77 @@ class SummaryCache:
         return {
             'successful_summaries': len(list(self.summaries_dir.glob('*.json'))),
             'failed_summaries': len(list(self.errors_dir.glob('*.json'))),
+            'daily_summaries': len(list(self.daily_dir.glob('*.json'))),
             'total_size_bytes': sum(
-                f.stat().st_size 
+                f.stat().st_size
                 for f in self.cache_dir.rglob('*.json')
             )
         }
+
+    def _get_daily_cache_key(self, project_path: str, date_str: str, turns_hash: str) -> str:
+        """Generate cache key for a daily project summary."""
+        # Normalize project path to avoid issues with trailing slashes
+        project_name = Path(project_path).name
+        project_hash = self._hash_content(project_path)[:8]
+        return f"daily_{project_name}_{project_hash}_{date_str}_{turns_hash}"
+
+    def get_daily_summary(
+        self,
+        project_path: str,
+        date_str: str,
+        turns_hash: str
+    ) -> Optional[str]:
+        """Retrieve cached daily summary for a project if it exists.
+
+        Args:
+            project_path: Path to the project
+            date_str: Date string (YYYY-MM-DD)
+            turns_hash: Hash of the turn content for cache invalidation
+
+        Returns:
+            Cached summary text or None
+        """
+        cache_key = self._get_daily_cache_key(project_path, date_str, turns_hash)
+        cache_path = self.daily_dir / f"{cache_key}.json"
+
+        if cache_path.exists():
+            try:
+                with open(cache_path, 'r') as f:
+                    data = json.load(f)
+                return data.get('summary')
+            except (json.JSONDecodeError, IOError):
+                cache_path.unlink(missing_ok=True)
+
+        return None
+
+    def store_daily_summary(
+        self,
+        project_path: str,
+        date_str: str,
+        turns_hash: str,
+        summary: str
+    ) -> None:
+        """Store a daily summary in cache.
+
+        Args:
+            project_path: Path to the project
+            date_str: Date string (YYYY-MM-DD)
+            turns_hash: Hash of the turn content
+            summary: The generated summary text
+        """
+        cache_key = self._get_daily_cache_key(project_path, date_str, turns_hash)
+        cache_path = self.daily_dir / f"{cache_key}.json"
+
+        data = {
+            'project_path': project_path,
+            'date': date_str,
+            'turns_hash': turns_hash,
+            'summary': summary,
+            'cached_at': datetime.now(timezone.utc).isoformat()
+        }
+
+        try:
+            with open(cache_path, 'w') as f:
+                json.dump(data, f, indent=2)
+        except IOError as e:
+            print(f"Warning: Failed to cache daily summary: {e}")

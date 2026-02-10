@@ -13,11 +13,13 @@ try:
     from .parser import Message, ConversationTurn
     from .cache import SummaryCache, SummaryResult
     from .utils import compact_tool_calls
+    from .git import get_project_display_name
 except ImportError:
     # Fall back to absolute imports (when running directly or with sys.path manipulation)
     from parser import Message, ConversationTurn
     from cache import SummaryCache, SummaryResult
     from utils import compact_tool_calls
+    from git import get_project_display_name
 
 
 def get_data_dir() -> Path:
@@ -669,6 +671,30 @@ Format your response as:
 ## Constraints/Preferences
 - [any stated preferences or constraints]"""
 
+        elif summary_type == 'daily':
+            return f"""Summarize all work accomplished in this Claude Code session for a daily standup or log.
+
+Session content:
+{session_content}
+
+Instructions:
+- Focus on outcomes and accomplishments, not process details
+- Group related work together
+- Be concise but complete
+- Use past tense (e.g., "Implemented...", "Fixed...", "Added...")
+- Highlight any blockers or incomplete work
+- Format as bullet points
+
+Structure your response as:
+## Completed
+- [what was accomplished]
+
+## In Progress (if applicable)
+- [work started but not finished]
+
+## Notes (if applicable)
+- [any blockers, decisions, or things to remember]"""
+
         else:  # 'work' - default
             return f"""Provide a detailed summary of all work done in this Claude Code session.
 
@@ -683,6 +709,313 @@ Focus on:
 - Overall progress and outcomes
 
 Be comprehensive but concise. Use bullet points for clarity."""
+
+
+    def generate_daily_summary(
+        self,
+        project_sessions: list,
+        git_data: dict = None,
+        progress_callback=None,
+        date_str: str = None
+    ) -> str:
+        """Generate a summary of all work done across projects for a day.
+
+        This uses a three-phase approach:
+        1. Generate per-turn summaries for each project (cached)
+        2. Compile those into per-project daily summaries (cached, done in parallel)
+        3. Combine project summaries into final output (no AI needed)
+
+        Args:
+            project_sessions: List of tuples (project_path, turns, git_summary)
+            git_data: Optional dict mapping project_path to git summary data
+            progress_callback: Optional callback(project_name, completed, total) for progress
+            date_str: Date string (YYYY-MM-DD) for cache key
+
+        Returns:
+            Generated daily summary text
+        """
+        return anyio.run(
+            self._generate_daily_summary_async,
+            project_sessions,
+            git_data,
+            progress_callback,
+            date_str
+        )
+
+    def generate_work_summary(
+        self,
+        project_sessions: list,
+        range_key: str = None,
+        progress_callback=None
+    ) -> str:
+        """Generate a summary of work done across projects for a time range.
+
+        Args:
+            project_sessions: List of tuples (project_path, turns, git_summary)
+            range_key: Cache key for the date range (e.g., "2024-01-01_to_2024-01-07")
+            progress_callback: Optional callback for progress updates
+
+        Returns:
+            Generated work summary text
+        """
+        return anyio.run(
+            self._generate_work_summary_async,
+            project_sessions,
+            range_key,
+            progress_callback
+        )
+
+    def _compute_turns_hash(self, turns: List[ConversationTurn]) -> str:
+        """Compute a hash representing the content of turns for cache invalidation."""
+        content_parts = []
+        for turn in turns:
+            if turn.user_message:
+                content_parts.append(str(turn.user_message.uuid))
+            for msg in turn.assistant_messages:
+                content_parts.append(str(msg.uuid))
+        combined = '|'.join(content_parts)
+        return hashlib.sha256(combined.encode()).hexdigest()[:16]
+
+    def _extract_key_messages_for_daily(self, turns: List[ConversationTurn]) -> str:
+        """Extract key messages from turns for daily summary generation.
+
+        Instead of generating AI summaries for each turn (expensive), extract:
+        - User messages (the actual requests)
+        - Final assistant response for each turn (often contains work report)
+        - Tool calls made (file edits, bash commands)
+
+        This captures the essential information with no API calls.
+        """
+        content_parts = []
+
+        for i, turn in enumerate(turns, 1):
+            turn_parts = []
+
+            # User request
+            user_content = self._extract_message_content(turn.user_message)
+            if user_content:
+                # Truncate very long user messages
+                if len(user_content) > 500:
+                    user_content = user_content[:500] + "..."
+                turn_parts.append(f"Request: {user_content}")
+
+            # Collect tool calls (focus on file operations and bash)
+            tool_summary = []
+            final_text = ""
+
+            for msg in turn.assistant_messages:
+                if msg.tool_name:
+                    tool_info = self._format_tool_call_for_prompt(
+                        msg.tool_name, msg.tool_args or {}, 'minimal'
+                    )
+                    # Only include substantive tool calls
+                    if msg.tool_name in ['Edit', 'MultiEdit', 'Write', 'Bash', 'Task']:
+                        tool_summary.append(tool_info)
+                else:
+                    # Track last text response (likely contains work summary)
+                    text = self._extract_message_content(msg)
+                    if text and len(text) > 50:
+                        final_text = text
+
+            if tool_summary:
+                # Limit to most relevant tools
+                if len(tool_summary) > 10:
+                    tool_summary = tool_summary[:10] + [f"... and {len(tool_summary) - 10} more"]
+                turn_parts.append(f"Actions: {'; '.join(tool_summary)}")
+
+            # Include final response snippet if it looks like a summary
+            if final_text:
+                # Take first 300 chars of final response
+                snippet = final_text[:300]
+                if len(final_text) > 300:
+                    snippet += "..."
+                turn_parts.append(f"Result: {snippet}")
+
+            if turn_parts:
+                content_parts.append(f"Turn {i}:")
+                content_parts.extend(f"  {part}" for part in turn_parts)
+                content_parts.append("")
+
+        return '\n'.join(content_parts)
+
+    async def _summarize_project_daily_async(
+        self,
+        project_path: str,
+        turns: List[ConversationTurn],
+        git_data: dict = None,
+        date_str: str = None
+    ) -> str:
+        """Generate a daily summary for a single project.
+
+        Uses direct message extraction instead of per-turn AI summaries:
+        1. Check cache for existing summary
+        2. Extract key messages from turns (no AI needed)
+        3. Single AI call to compile into project daily summary
+        4. Cache the result
+        """
+        from claude_agent_sdk import query, ClaudeAgentOptions
+
+        project_name = get_project_display_name(project_path)
+
+        # Compute turns hash for cache key
+        turns_hash = self._compute_turns_hash(turns)
+
+        # Check cache first
+        if date_str:
+            cached = self.cache.get_daily_summary(project_path, date_str, turns_hash)
+            if cached:
+                return cached
+
+        # Extract key messages directly (no AI calls)
+        extracted_content = self._extract_key_messages_for_daily(turns)
+
+        # Build content for AI compilation
+        content_parts = []
+
+        # Add git info
+        if git_data and git_data.get('is_git_repo'):
+            commits = git_data.get('commits', [])
+            stats = git_data.get('stats', {})
+            if commits:
+                content_parts.append(f"Git: {len(commits)} commits, +{stats.get('lines_added', 0)}/-{stats.get('lines_removed', 0)} lines")
+                for commit in commits[:5]:
+                    content_parts.append(f"  - {commit['hash']}: {commit['message']}")
+                content_parts.append("")
+
+        content_parts.append(extracted_content)
+
+        turn_content = '\n'.join(content_parts)
+
+        # Single AI call to compile into project summary
+        prompt = f"""Summarize the work done in the "{project_name}" project based on these conversation excerpts.
+
+{turn_content}
+
+Instructions:
+- Focus on outcomes and accomplishments
+- Group related work together
+- 2-5 bullet points maximum
+- Use past tense (e.g., "Implemented...", "Fixed...", "Added...")
+- Include git stats if relevant
+
+Output ONLY the bullet points, no headers or extra text."""
+
+        options = ClaudeAgentOptions(
+            permission_mode='default',
+            env={'CLAUDE_CONFIG_DIR': str(self._claude_config_dir)}
+        )
+
+        response_parts = []
+        async for message in query(prompt=prompt, options=options):
+            text_content = self._extract_sdk_message_content(message)
+            if text_content:
+                response_parts.append(text_content)
+
+        summary = ''.join(response_parts).strip()
+
+        # Cache the result
+        if date_str:
+            self.cache.store_daily_summary(project_path, date_str, turns_hash, summary)
+
+        return summary
+
+    async def _generate_daily_summary_async(
+        self,
+        project_sessions: list,
+        git_data: dict = None,
+        progress_callback=None,
+        date_str: str = None
+    ) -> str:
+        """Generate daily summary by combining per-project summaries.
+
+        Three-phase approach:
+        1. Per-turn summaries (cached, per project)
+        2. Per-project daily summary (AI compiles turns, done in parallel, cached)
+        3. Combine project summaries (simple concatenation, no AI)
+        """
+        import asyncio
+
+        try:
+            # Generate per-project daily summaries in parallel
+            async def summarize_one_project(project_path, turns, project_git):
+                summary = await self._summarize_project_daily_async(
+                    project_path, turns, project_git, date_str
+                )
+                return project_path, summary
+
+            tasks = [
+                summarize_one_project(path, turns, git)
+                for path, turns, git in project_sessions
+            ]
+
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+
+            # Phase 3: Combine project summaries (no AI needed)
+            output_parts = ["# Daily Summary", ""]
+
+            for result in results:
+                if isinstance(result, Exception):
+                    continue
+                project_path, summary = result
+                project_name = get_project_display_name(project_path)
+
+                output_parts.append(f"## {project_name}")
+                output_parts.append(summary)
+                output_parts.append("")
+
+            return '\n'.join(output_parts).strip()
+
+        except ImportError as e:
+            return f"Error: Claude Agent SDK not available: {e}"
+        except Exception as e:
+            return f"Error generating daily summary: {e}"
+
+    async def _generate_work_summary_async(
+        self,
+        project_sessions: list,
+        range_key: str = None,
+        progress_callback=None
+    ) -> str:
+        """Generate work summary by combining per-project summaries.
+
+        Similar to daily summary but uses range_key for caching.
+        """
+        import asyncio
+
+        try:
+            # Generate per-project summaries in parallel
+            async def summarize_one_project(project_path, turns, project_git):
+                summary = await self._summarize_project_daily_async(
+                    project_path, turns, project_git, range_key
+                )
+                return project_path, summary
+
+            tasks = [
+                summarize_one_project(path, turns, git)
+                for path, turns, git in project_sessions
+            ]
+
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+
+            # Combine project summaries (no AI needed)
+            output_parts = ["# Work Summary", ""]
+
+            for result in results:
+                if isinstance(result, Exception):
+                    continue
+                project_path, summary = result
+                project_name = get_project_display_name(project_path)
+
+                output_parts.append(f"## {project_name}")
+                output_parts.append(summary)
+                output_parts.append("")
+
+            return '\n'.join(output_parts).strip()
+
+        except ImportError as e:
+            return f"Error: Claude Agent SDK not available: {e}"
+        except Exception as e:
+            return f"Error generating work summary: {e}"
 
 
 class SummarizerAvailability:

@@ -128,6 +128,65 @@ def validate_since_date(since_str: str) -> Optional[str]:
         return str(e)
 
 
+def parse_date_offset(date_str: str) -> datetime:
+    """Parse a date that may be an absolute date or a relative day offset.
+
+    Supported formats:
+    - Relative: -1d (yesterday), -2d (2 days ago), -1w (1 week ago)
+    - Also: 0d (today)
+    - Absolute: 2024-12-01
+
+    Respects day_start_hour from user config. If day_start_hour is 5 and
+    it's 3am, "0d" means yesterday at 5am (the current "virtual day").
+
+    Args:
+        date_str: Date string to parse
+
+    Returns:
+        datetime object for the start of the target day
+
+    Raises:
+        ValueError: If the format is not recognized
+    """
+    from .config import get_day_start_hour
+
+    date_str = date_str.strip()
+    day_start = get_day_start_hour()
+
+    offset_pattern = r'^(-?\d+)([dw])$'
+    match = re.match(offset_pattern, date_str.lower())
+    if match:
+        amount, unit = int(match.group(1)), match.group(2)
+        now = datetime.now(timezone.utc)
+
+        # Determine the effective "today" based on day_start_hour
+        if day_start > 0 and now.hour < day_start:
+            effective_today = now.date() - timedelta(days=1)
+        else:
+            effective_today = now.date()
+
+        if unit == 'd':
+            target = effective_today + timedelta(days=amount)
+        elif unit == 'w':
+            target = effective_today + timedelta(weeks=amount)
+
+        return datetime.combine(target, datetime.min.time()).replace(
+            hour=day_start, tzinfo=timezone.utc
+        )
+
+    # Try absolute YYYY-MM-DD
+    try:
+        parsed = datetime.strptime(date_str, '%Y-%m-%d')
+        return parsed.replace(tzinfo=timezone.utc)
+    except ValueError:
+        pass
+
+    raise ValueError(
+        f"Invalid date: '{date_str}'. "
+        f"Use YYYY-MM-DD or relative offset (-1d, -2w, 0d)"
+    )
+
+
 # Examples for testing/documentation
 SINCE_EXAMPLES = [
     # Relative formats

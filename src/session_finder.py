@@ -19,10 +19,47 @@ class SessionNotFoundError(Exception):
 
 def path_to_project_name(project_path: str) -> str:
     """Convert a project path to Claude Code's hyphenated format.
-    
+
     Example: /home/user/projects/my-app -> -home-user-projects-my-app
     """
     return project_path.replace('/', '-')
+
+
+def get_project_cwd_from_session(session_file: Path) -> Optional[str]:
+    """Extract the original project path (cwd) from a session file.
+
+    Session files contain a 'cwd' field that stores the actual filesystem path
+    where Claude Code was running. This is more reliable than trying to
+    reverse-engineer the hyphenated directory name.
+
+    Args:
+        session_file: Path to a session JSONL file
+
+    Returns:
+        The cwd path string, or None if not found
+    """
+    try:
+        with open(session_file, 'r') as f:
+            # Read from the end to get the most recent cwd
+            # (in case the project was moved during the session)
+            lines = f.readlines()
+
+        # Search backwards for a line with cwd
+        for line in reversed(lines):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                msg = json.loads(line)
+                cwd = msg.get('cwd')
+                if cwd:
+                    return cwd
+            except json.JSONDecodeError:
+                continue
+
+        return None
+    except (IOError, OSError):
+        return None
 
 
 def find_claude_projects_dir() -> Path:
@@ -279,3 +316,186 @@ def format_no_sessions_error(project_path: str) -> str:
             lines.append("Tip: Run 'cc-summarize --list' from within your project directory")
 
     return '\n'.join(lines)
+
+
+def list_all_projects() -> List[Dict]:
+    """List all projects that have Claude Code sessions.
+
+    Returns:
+        List of dictionaries with project info:
+        - 'project_path': Original file system path (from session cwd)
+        - 'session_dir': Path to the session directory
+        - 'session_count': Number of session files
+        - 'last_activity': Most recent session modification time
+    """
+    try:
+        claude_dir = find_claude_projects_dir()
+    except FileNotFoundError:
+        return []
+
+    projects = []
+
+    for project_dir in claude_dir.iterdir():
+        if not project_dir.is_dir():
+            continue
+
+        # Find session files (exclude agent-* subagent files)
+        session_files = [
+            f for f in project_dir.glob('*.jsonl')
+            if not f.name.startswith('agent-')
+        ]
+
+        if not session_files:
+            continue
+
+        # Sort by modification time (most recent first) to get cwd from latest session
+        session_files_sorted = sorted(
+            session_files,
+            key=lambda f: f.stat().st_mtime,
+            reverse=True
+        )
+
+        # Extract actual project path from the most recent session's cwd field
+        project_path = None
+        for session_file in session_files_sorted:
+            project_path = get_project_cwd_from_session(session_file)
+            if project_path:
+                break
+
+        # Fallback to old method if cwd not found in any session
+        if not project_path:
+            project_name = project_dir.name
+            if project_name.startswith('-'):
+                project_path = project_name.replace('-', '/')
+            else:
+                project_path = '/' + project_name.replace('-', '/')
+
+        # Get most recent activity
+        most_recent = max(f.stat().st_mtime for f in session_files)
+        last_activity = datetime.fromtimestamp(most_recent, tz=timezone.utc)
+
+        projects.append({
+            'project_path': project_path,
+            'session_dir': str(project_dir),
+            'session_count': len(session_files),
+            'last_activity': last_activity.isoformat()
+        })
+
+    # Sort by most recent activity
+    projects.sort(key=lambda p: p['last_activity'], reverse=True)
+    return projects
+
+
+def list_sessions_for_date(
+    project_path: str,
+    target_date: datetime
+) -> List[Dict]:
+    """List sessions that have activity on a specific date.
+
+    Args:
+        project_path: Path to the project directory
+        target_date: The date to filter by (uses date portion only)
+
+    Returns:
+        List of session metadata dictionaries
+    """
+    # Get all sessions
+    sessions = list_sessions(project_path, include_empty=False)
+
+    # Filter to sessions with activity on the target date
+    target_date_only = target_date.date() if hasattr(target_date, 'date') else target_date
+    filtered = []
+
+    for session in sessions:
+        if 'error' in session:
+            continue
+
+        # Check last_modified date
+        last_modified = session.get('last_modified')
+        if last_modified:
+            try:
+                session_dt = datetime.fromisoformat(last_modified.replace('Z', '+00:00'))
+                if session_dt.date() == target_date_only:
+                    filtered.append(session)
+            except (ValueError, AttributeError):
+                continue
+
+    return filtered
+
+
+def get_sessions_across_projects(
+    target_date: datetime
+) -> List[Tuple[str, List[Dict]]]:
+    """Get all sessions across all projects for a specific date.
+
+    Args:
+        target_date: The date to filter by
+
+    Returns:
+        List of tuples: (project_path, list of session metadata)
+    """
+    all_projects = list_all_projects()
+    results = []
+
+    for project in all_projects:
+        project_path = project['project_path']
+        sessions = list_sessions_for_date(project_path, target_date)
+        if sessions:
+            results.append((project_path, sessions))
+
+    return results
+
+
+def get_sessions_in_range(
+    start_date: datetime,
+    end_date: datetime = None
+) -> List[Tuple[str, List[Dict]]]:
+    """Get all sessions across all projects within a date range.
+
+    Args:
+        start_date: Start of the range (inclusive)
+        end_date: End of the range (inclusive), defaults to now
+
+    Returns:
+        List of tuples: (project_path, list of session metadata)
+    """
+    if end_date is None:
+        end_date = datetime.now(timezone.utc)
+
+    all_projects = list_all_projects()
+    results = []
+
+    for project in all_projects:
+        project_path = project['project_path']
+
+        # Get all sessions and filter by date range
+        sessions = list_sessions(project_path)
+        filtered = []
+
+        for session in sessions:
+            # Parse the last_modified timestamp
+            last_mod = session.get('last_modified', '')
+            if not last_mod:
+                continue
+
+            try:
+                # Parse ISO timestamp
+                if last_mod.endswith('Z'):
+                    session_time = datetime.fromisoformat(last_mod.replace('Z', '+00:00'))
+                else:
+                    session_time = datetime.fromisoformat(last_mod)
+
+                # Make timezone-aware if needed
+                if session_time.tzinfo is None:
+                    session_time = session_time.replace(tzinfo=timezone.utc)
+
+                # Check if in range
+                if start_date <= session_time <= end_date:
+                    filtered.append(session)
+            except (ValueError, TypeError):
+                continue
+
+        if filtered:
+            results.append((project_path, filtered))
+
+    return results

@@ -8,6 +8,7 @@ A tool for managing, viewing, and summarizing Claude Code sessions.
 import os
 import sys
 import click
+from datetime import date, datetime, timezone
 from typing import List, Optional
 from dotenv import load_dotenv
 from pathlib import Path
@@ -17,7 +18,10 @@ from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskPr
 # Add src to path for imports
 sys.path.insert(0, str(Path(__file__).parent / 'src'))
 
-from session_finder import list_sessions, find_session_by_id, format_no_sessions_error
+from session_finder import (
+    list_sessions, find_session_by_id, format_no_sessions_error,
+    list_sessions_for_date, get_sessions_across_projects, list_all_projects
+)
 from parser import SessionParser
 from no_ai_summarizer import NoAISummarizer, UserOnlyExtractor, MessageExtractor
 from cache import SummaryCache
@@ -67,12 +71,15 @@ console = Console()
 @click.option('--verbose', '-v', is_flag=True, help='Show verbose output (e.g., full session IDs)')
 @click.option('--no-truncate', is_flag=True, help='Show full content without truncation')
 @click.option('--since', help='Include only messages since date/time (e.g., 1d, 2h, 30m, 1w, 2024-12-01)')
-@click.option('--summary', type=click.Choice(['default', 'commit', 'requirements']),
-              help='Generate a summary: default (session work), commit (conventional commit message), requirements (extract user requirements)')
+@click.option('--summary', type=click.Choice(['default', 'commit', 'requirements', 'work']),
+              help='Generate a summary: default (session work), commit (conventional commit), requirements (user requirements), work (accomplishments in time range)')
+@click.option('--all-projects', is_flag=True, help='Look across all projects (for --summary work)')
+@click.option('--date', 'summary_date',
+              help='Date for --summary work (YYYY-MM-DD or -1d for yesterday, -2w for 2 weeks ago)')
 @click.version_option(version='1.2.0')
 def main(project, session, pick, from_date, to_date, output_format, with_plans, with_summaries, with_subagent,
          with_assistant, with_all, summarize, plain, separator, output, metadata, interactive, list_sessions,
-         retry_failed, clear_cache, redo, verbose, no_truncate, since, summary):
+         retry_failed, clear_cache, redo, verbose, no_truncate, since, summary, all_projects, summary_date):
     """Claude Code Session Summarizer
 
     Manage, view, and summarize Claude Code sessions for a project.
@@ -172,7 +179,10 @@ def main(project, session, pick, from_date, to_date, output_format, with_plans, 
 
         # Handle --summary as a dedicated operation (session-level AI summary)
         if summary:
-            handle_session_summary(project_path, session, from_date, to_date, since_date, summary)
+            if summary == 'work':
+                handle_work_summary(project_path, all_projects, summary_date, since_date)
+            else:
+                handle_session_summary(project_path, session, from_date, to_date, since_date, summary)
             return
 
         # Main processing logic (message extraction or per-turn summarization)
@@ -358,6 +368,155 @@ def handle_session_summary(
     # Generate summary using Summarizer
     summarizer = Summarizer(project_path=str(project_path))
     result = summarizer.generate_session_summary(turns, summary_type)
+
+    # Output the result
+    click.echo(result)
+
+
+def handle_work_summary(
+    project_path: Path,
+    all_projects: bool,
+    end_date,
+    since_date
+) -> None:
+    """Handle work summary generation for a time range.
+
+    Args:
+        project_path: Path to the current project (used if not all_projects)
+        all_projects: Whether to summarize across all projects
+        end_date: End date for the range (None = today)
+        since_date: Start of the range (None = start of end_date)
+    """
+    from src.summarizer import Summarizer, SummarizerAvailability
+    from src.git import get_daily_git_summary, format_git_summary, get_project_display_name
+    from src.session_finder import get_sessions_in_range
+    from src.date_parser import parse_date_offset
+
+    # Check SDK availability
+    if not SummarizerAvailability.is_available():
+        error_msg = SummarizerAvailability.get_error_message()
+        click.echo(f"Error: {error_msg}", err=True)
+        sys.exit(1)
+
+    # Determine date range
+    if end_date:
+        try:
+            parsed_end = parse_date_offset(end_date)
+        except ValueError as e:
+            click.echo(f"Error: {e}", err=True)
+            sys.exit(1)
+        range_end = datetime.combine(
+            parsed_end.date(),
+            datetime.max.time()
+        ).replace(tzinfo=timezone.utc)
+    else:
+        range_end = datetime.now(timezone.utc)
+
+    if since_date:
+        range_start = since_date
+    elif end_date:
+        # --date without --since: summarize just that date
+        range_start = parsed_end
+    else:
+        # No --date, no --since: default to start of today (respects day_start_hour)
+        from src.config import today_with_offset
+        range_start = today_with_offset()
+
+    # Format range for display
+    start_str = range_start.strftime('%Y-%m-%d')
+    end_str = range_end.strftime('%Y-%m-%d')
+    if start_str == end_str:
+        click.echo(f"Generating work summary for {start_str}...", err=True)
+    else:
+        click.echo(f"Generating work summary for {start_str} to {end_str}...", err=True)
+
+    # Collect sessions and git data
+    project_sessions = []
+    parser = SessionParser()
+
+    if all_projects:
+        # Get sessions across all projects in range
+        sessions_by_project = get_sessions_in_range(range_start, range_end)
+
+        if not sessions_by_project:
+            click.echo(f"No Claude Code sessions found in the specified range.", err=True)
+            return
+
+        click.echo(f"Found activity in {len(sessions_by_project)} project(s)", err=True)
+
+        for proj_path, sessions in sessions_by_project:
+            session_files = [s.get('file_path') for s in sessions if s.get('file_path')]
+            if not session_files:
+                continue
+
+            # Parse sessions
+            messages = parser.parse_multiple_files(session_files)
+
+            # Filter messages to the date range
+            messages = filter_messages_since(messages, range_start)
+
+            turns = parser.build_conversation_turns(messages)
+
+            if turns:
+                # Get git data for this project (for the date range)
+                # For now, get git data for the end date; could be extended for ranges
+                git_data = get_daily_git_summary(proj_path, range_end.date())
+                project_sessions.append((proj_path, turns, git_data))
+
+                git_summary = format_git_summary(git_data)
+                click.echo(f"  {get_project_display_name(proj_path)}: {len(turns)} turns, git: {git_summary}", err=True)
+    else:
+        # Single project mode
+        sessions = list_sessions(str(project_path))
+
+        # Filter to date range
+        filtered_sessions = []
+        for session in sessions:
+            last_mod = session.get('last_modified', '')
+            if not last_mod:
+                continue
+            try:
+                if last_mod.endswith('Z'):
+                    session_time = datetime.fromisoformat(last_mod.replace('Z', '+00:00'))
+                else:
+                    session_time = datetime.fromisoformat(last_mod)
+                if session_time.tzinfo is None:
+                    session_time = session_time.replace(tzinfo=timezone.utc)
+                if range_start <= session_time <= range_end:
+                    filtered_sessions.append(session)
+            except (ValueError, TypeError):
+                continue
+
+        if not filtered_sessions:
+            click.echo(f"No sessions found in the specified range.", err=True)
+            click.echo("Use --all-projects to search across all projects.", err=True)
+            return
+
+        session_files = [s.get('file_path') for s in filtered_sessions if s.get('file_path')]
+        messages = parser.parse_multiple_files(session_files)
+
+        # Filter messages to the date range
+        messages = filter_messages_since(messages, range_start)
+
+        turns = parser.build_conversation_turns(messages)
+
+        if turns:
+            git_data = get_daily_git_summary(str(project_path), range_end.date())
+            project_sessions.append((str(project_path), turns, git_data))
+
+            git_summary = format_git_summary(git_data)
+            click.echo(f"Found {len(turns)} turns, git: {git_summary}", err=True)
+
+    if not project_sessions:
+        click.echo("No conversation turns found in the specified range.", err=True)
+        return
+
+    click.echo("\nGenerating Work Summary...\n", err=True)
+
+    # Generate summary with date range info
+    range_key = f"{start_str}_to_{end_str}"
+    summarizer = Summarizer(project_path=str(project_path))
+    result = summarizer.generate_work_summary(project_sessions, range_key=range_key)
 
     # Output the result
     click.echo(result)
